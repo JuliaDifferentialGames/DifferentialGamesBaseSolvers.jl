@@ -3,7 +3,17 @@ uuid = "b83b0c57-42fa-43ab-a182-d5be40f43772"
 authors = ["BennetOutland <bennet.outland@pm.me> and contributors"]
 version = "1.0.0-DEV"
 
+[deps]
+DifferentialGamesBase = "a9dd1e63-b4ad-4579-bca8-3a609f3d87b9"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Revise = "295af30f-e4ad-537b-8983-00126c2a3abe"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+
 [compat]
+DifferentialGamesBase = "1.0.0"
+LinearAlgebra = "1.11.0"
+Revise = "3.13.1"
+SparseArrays = "1.11.0"
 julia = "1.10.10"
 
 [extras]
