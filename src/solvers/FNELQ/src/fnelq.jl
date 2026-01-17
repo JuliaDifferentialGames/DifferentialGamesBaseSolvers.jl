@@ -1,3 +1,5 @@
+using DifferentialGamesBase
+
 """
     FNELQ <: GameSolver
 
