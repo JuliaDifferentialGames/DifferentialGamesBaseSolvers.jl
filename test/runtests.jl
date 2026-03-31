@@ -1,9 +1,7 @@
 using DifferentialGamesBaseSolvers
 using Test
 
-
-include("../src/solvers/FNELQ/test/fnelq_tests.jl")
-
-# @testset "DifferentialGamesBaseSolvers.jl" begin
-#     # Write your tests here.
-# end
+@testset "DifferentialGamesBaseSolvers.jl" begin
+    include("../src/solvers/FNELQ/test/fnelq_tests.jl")
+    include("../src/solvers/PANGOLIN/test/pangolin_tests.jl")
+end
