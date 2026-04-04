@@ -671,44 +671,62 @@ function lq_approximation!(
     n_p = lqg.n_players
     dyn = game.dynamics
 
+    is_sep        = dyn isa SeparableDynamics
+    state_offsets = game.metadata.state_offsets
+    state_dims    = game.metadata.state_dims
+
     for k in 1:N
         x_k = op.x[k]
-        u_k = [op.u[i][k] for i in 1:n_p]   # per-player controls at step k
+        u_k = [op.u[i][k] for i in 1:n_p]
 
-        # ── Dynamics linearization ────────────────────────────────────────────
         A_k, B_vecs_k, d_k = linearize(dyn, x_k, u_k, k)
-
-        # Write into scratch — copy! to avoid aliasing with accessor return values
         copyto!(lqg.A[k], A_k)
         copyto!(lqg.d[k], d_k)
         for i in 1:n_p
             copyto!(lqg.B[i][k], B_vecs_k[i])
         end
 
-        # ── Cost quadraticization ─────────────────────────────────────────────
         for i in 1:n_p
-            sc = game.objectives[i].stage_cost
-            u_ik = op.u[i][k]
+            sc   = game.objectives[i].stage_cost
+            xi_k = is_sep ? x_k[state_offsets[i]+1 : state_offsets[i]+state_dims[i]] : x_k
 
-            Q_k, R_k, M_k, q_k, r_k, c_k = quadraticize(sc, x_k, u_ik, k)
+            Q_k, R_k, M_k, q_k, r_k, _ = quadraticize(sc, xi_k, op.u[i][k], k)
 
-            # Symmetry is enforced inside quadraticize; copy into scratch
-            copyto!(lqg.Q[i][k], Q_k)
+            if is_sep
+                ni   = state_dims[i]
+                rows = state_offsets[i]+1 : state_offsets[i]+ni
+                fill!(lqg.Q[i][k], zero(T))
+                lqg.Q[i][k][rows, rows] .= Q_k
+                fill!(lqg.M[i][k], zero(T))
+                lqg.M[i][k][rows, :] .= M_k
+                fill!(lqg.q[i][k], zero(T))
+                lqg.q[i][k][rows] .= q_k
+            else
+                copyto!(lqg.Q[i][k], Q_k)
+                copyto!(lqg.M[i][k], M_k)
+                copyto!(lqg.q[i][k], q_k)
+            end
             copyto!(lqg.R[i][k], R_k)
-            copyto!(lqg.M[i][k], M_k)
-            copyto!(lqg.q[i][k], q_k)
             copyto!(lqg.r[i][k], r_k)
-            # c_k (scalar) is not stored; iLQGames backward pass doesn't need constants
         end
     end
 
-    # ── Terminal cost quadraticization ────────────────────────────────────────
     x_N = op.x[N+1]
     for i in 1:n_p
-        tc = game.objectives[i].terminal_cost
-        Qf_i, qf_i = quadraticize(tc, x_N)
-        copyto!(lqg.Qf[i], Qf_i)
-        copyto!(lqg.qf[i], qf_i)
+        tc   = game.objectives[i].terminal_cost
+        xi_N = is_sep ? x_N[state_offsets[i]+1 : state_offsets[i]+state_dims[i]] : x_N
+        Qf_i, qf_i = quadraticize(tc, xi_N)
+        if is_sep
+            ni   = state_dims[i]
+            rows = state_offsets[i]+1 : state_offsets[i]+ni
+            fill!(lqg.Qf[i], zero(T))
+            lqg.Qf[i][rows, rows] .= Qf_i
+            fill!(lqg.qf[i], zero(T))
+            lqg.qf[i][rows] .= qf_i
+        else
+            copyto!(lqg.Qf[i], Qf_i)
+            copyto!(lqg.qf[i], qf_i)
+        end
     end
 
     return lqg

@@ -167,6 +167,7 @@ struct PANGOLIN <: GameSolver
         α_init::Float64             = 0.5,
         α_step::Float64             = 0.5,
         convergence_tol::Float64    = 1e-3,
+        max_elwise_diff_step::Float64 = 0.0,   # 0 → auto: 30 * convergence_tol
         state_regularization::Float64  = 0.0,
         control_regularization::Float64 = 0.0,
         constraint_opts::ALOptions{Float64} = ALOptions(),
@@ -183,12 +184,14 @@ struct PANGOLIN <: GameSolver
         @assert convergence_tol > 0
         @assert init_mode in (:zero_control, :straight_line, :warmstart)
 
-        max_elwise_diff_step = 30.0 * convergence_tol   # matches iLQGames.jl: 30 * max_elwise_diff_converged
+        # Auto-compute max_elwise_diff_step if not provided.
+        # iLQGames.jl uses 30 * max_elwise_diff_converged; expose for problem-scale tuning.
+        step_limit = max_elwise_diff_step > 0 ? max_elwise_diff_step : 30.0 * convergence_tol
 
         new(
             max_iter, max_line_search_iter,
             α_init, α_step,
-            convergence_tol, max_elwise_diff_step,
+            convergence_tol, step_limit,
             state_regularization, control_regularization,
             constraint_opts, init_mode,
             use_strategy_warmstart, dyn_consistency_tol,
@@ -406,7 +409,8 @@ function backtrack_scale!(
     last_op::OperatingPoint{T},
     game::GameProblem{T},
     solver::PANGOLIN,
-    x0::Vector{T}
+    x0::Vector{T};
+    first_iter::Bool = false
 ) where {T}
     max_dev = T(solver.max_elwise_diff_step)
     N       = length(op.x) - 1
@@ -416,14 +420,16 @@ function backtrack_scale!(
         sf = (i == 1) ? T(solver.α_init) : T(solver.α_step)
         scale_feedforward!(strat, sf)
 
-        # Reset op to last_op so deviation check has the right reference
+        # Reset op to last_op so deviation check has the correct reference
         for k in 1:N+1; op.x[k] .= last_op.x[k]; end
         for p in 1:n_p, k in 1:N; op.u[p][k] .= last_op.u[p][k]; end
 
-        # First attempt: no deviation check — guarantees at least one rollout succeeds.
-        # This matches iLQGames.jl behaviour where the first scale is always accepted
-        # as a starting point; subsequent attempts tighten the deviation gate.
-        dev = (i == 1) ? T(Inf) : max_dev
+        # Skip deviation check only on the very first outer iteration where
+        # last_op was built with a zero strategy and any nonzero gains will
+        # produce a large apparent deviation. On all subsequent iterations,
+        # enforce the deviation limit to prevent the line search from accepting
+        # arbitrarily large steps that cause the operating point to cycle.
+        dev = (first_iter && i == 1) ? T(Inf) : max_dev
         rollout!(op, game, strat, x0; max_deviation=dev) && return true
     end
     return false
@@ -622,7 +628,8 @@ function _solve(
         for k in 1:N+1; last_op.x[k] .= current_op.x[k]; end
         for i in 1:n_p, k in 1:N; last_op.u[i][k] .= current_op.u[i][k]; end
 
-        success = backtrack_scale!(strat, current_op, last_op, game, solver, x0)
+        success = backtrack_scale!(strat, current_op, last_op, game, solver, x0;
+                                   first_iter = (i_iter == 0))
         if !success
             verbose && @warn "PANGOLIN: line search failed at iter $i_iter"
             break
@@ -631,7 +638,7 @@ function _solve(
         # 4 & 5. Dual update + penalty schedule
         if !is_unconstrained(game)
             for i in 1:n_p
-                update_multipliers!(al_objs[i], current_op)
+                update_multipliers!(al_objs[i], current_op, game)
             end
             _, viol = update_shared_multipliers!(
                 al_state,
@@ -698,6 +705,12 @@ function _lq_approx_al!(
     n_p = lqg.n_players
     dyn = game.dynamics
 
+    # For separable dynamics, each player's cost sees only their own state slice.
+    # For coupled dynamics, all costs see the full joint state.
+    is_sep = dyn isa SeparableDynamics
+    state_offsets = game.metadata.state_offsets
+    state_dims    = game.metadata.state_dims
+
     for k in 1:N
         x_k = op.x[k]
         u_k = [op.u[i][k] for i in 1:n_p]
@@ -708,20 +721,57 @@ function _lq_approx_al!(
         for i in 1:n_p; copyto!(lqg.B[i][k], B_vecs_k[i]); end
 
         for i in 1:n_p
-            Q_k, R_k, M_k, q_k, r_k, _ = quadraticize(al_objs[i], x_k, op.u[i][k], k)
-            copyto!(lqg.Q[i][k], Q_k)
+            xi_k = is_sep ? x_k[state_offsets[i]+1 : state_offsets[i]+state_dims[i]] : x_k
+
+            # For separable dynamics, tell quadraticize which columns of the
+            # joint-state Jacobian correspond to player i's state block.
+            player_cols = is_sep ?
+                (state_offsets[i]+1 : state_offsets[i]+state_dims[i]) : nothing
+
+            Q_k, R_k, M_k, q_k, r_k, _ = quadraticize(
+                al_objs[i], xi_k, op.u[i][k], k;
+                x_joint = is_sep ? x_k : nothing,
+                player_state_cols = player_cols
+            )
+
+            # Q_k is (nᵢ × nᵢ) for separable; q_k may be (nᵢ,) for base cost
+            # but could be (n_joint,) if shared constraint Jacobian was full-width.
+            # quadraticize returns q sized to x_ref, so it is (nᵢ,) here.
+            # Embed into full scratch matrices.
+            if is_sep
+                ni   = state_dims[i]
+                rows = state_offsets[i]+1 : state_offsets[i]+ni
+                fill!(lqg.Q[i][k], zero(T))
+                lqg.Q[i][k][rows, rows] .= Q_k
+                fill!(lqg.M[i][k], zero(T))
+                lqg.M[i][k][rows, :] .= M_k
+                fill!(lqg.q[i][k], zero(T))
+                lqg.q[i][k][rows] .= q_k
+            else
+                copyto!(lqg.Q[i][k], Q_k)
+                copyto!(lqg.M[i][k], M_k)
+                copyto!(lqg.q[i][k], q_k)
+            end
             copyto!(lqg.R[i][k], R_k)
-            copyto!(lqg.M[i][k], M_k)
-            copyto!(lqg.q[i][k], q_k)
             copyto!(lqg.r[i][k], r_k)
         end
     end
 
     x_N = op.x[N+1]
     for i in 1:n_p
-        Qf_i, qf_i = quadraticize(game.objectives[i].terminal_cost, x_N)
-        copyto!(lqg.Qf[i], Qf_i)
-        copyto!(lqg.qf[i], qf_i)
+        xi_N = is_sep ? x_N[state_offsets[i]+1 : state_offsets[i]+state_dims[i]] : x_N
+        Qf_i, qf_i = quadraticize(game.objectives[i].terminal_cost, xi_N)
+        if is_sep
+            ni   = state_dims[i]
+            rows = state_offsets[i]+1 : state_offsets[i]+ni
+            fill!(lqg.Qf[i], zero(T))
+            lqg.Qf[i][rows, rows] .= Qf_i
+            fill!(lqg.qf[i], zero(T))
+            lqg.qf[i][rows] .= qf_i
+        else
+            copyto!(lqg.Qf[i], Qf_i)
+            copyto!(lqg.qf[i], qf_i)
+        end
     end
     return lqg
 end
@@ -730,14 +780,28 @@ function _trajectory_costs(game::GameProblem{T}, op::OperatingPoint{T}) where {T
     N   = length(op.x) - 1
     n_p = game.n_players
     costs = zeros(T, n_p)
+
+    is_sep        = game.dynamics isa SeparableDynamics
+    state_offsets = game.metadata.state_offsets
+    state_dims    = game.metadata.state_dims
+
     for i in 1:n_p
         sc = game.objectives[i].stage_cost
+        tc = game.objectives[i].terminal_cost
+
         for k in 1:N
-            costs[i] += T(evaluate_stage_cost(sc, op.x[k], op.u[i][k], nothing, k))
+            xi_k = is_sep ? op.x[k][state_offsets[i]+1 : state_offsets[i]+state_dims[i]] :
+                            op.x[k]
+            costs[i] += T(evaluate_stage_cost(sc, xi_k, op.u[i][k], nothing, k))
         end
-        Qf_i, qf_i = quadraticize(game.objectives[i].terminal_cost, op.x[N+1])
-        costs[i]  += T(0.5 * op.x[N+1]' * Qf_i * op.x[N+1] + qf_i' * op.x[N+1])
-        costs[i]  *= game.objectives[i].scaling
+
+        xi_N = is_sep ? op.x[N+1][state_offsets[i]+1 : state_offsets[i]+state_dims[i]] :
+                        op.x[N+1]
+        # Evaluate the actual terminal cost function, not the quadratic approximation.
+        # The quadratic approximation 0.5*x'Qf*x + qf'*x is only valid near the
+        # linearization point and can be arbitrarily negative far from it.
+        costs[i] += T(evaluate_terminal_cost(tc, xi_N, nothing))
+        costs[i] *= game.objectives[i].scaling
     end
     return costs
 end
@@ -747,7 +811,23 @@ function _op_to_trajectories(op::OperatingPoint{T}, game::GameProblem{T}) where 
     n_p    = game.n_players
     t_vec  = collect(range(T(0), game.time_horizon.tf, length=N+1))
     costs  = _trajectory_costs(game, op)
-    states = hcat(op.x...)
 
-    return [Trajectory(i, states, hcat(op.u[i]...), t_vec, costs[i]) for i in 1:n_p]
+    is_sep        = game.dynamics isa SeparableDynamics
+    state_offsets = game.metadata.state_offsets
+    state_dims    = game.metadata.state_dims
+
+    trajectories = Trajectory{T}[]
+    for i in 1:n_p
+        # Extract player i's state slice from the joint trajectory
+        if is_sep
+            ni     = state_dims[i]
+            rows   = state_offsets[i]+1 : state_offsets[i]+ni
+            states = hcat([op.x[k][rows] for k in 1:N+1]...)
+        else
+            states = hcat(op.x...)
+        end
+        ctrl_mat = hcat(op.u[i]...)
+        push!(trajectories, Trajectory(i, states, ctrl_mat, t_vec, costs[i]))
+    end
+    return trajectories
 end

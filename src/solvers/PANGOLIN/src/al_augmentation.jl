@@ -251,34 +251,30 @@ function augmented_stage_cost(
     obj::ALAugmentedObjective{T},
     x::AbstractVector,
     u::AbstractVector,
-    k::Int
+    k::Int;
+    x_joint::Union{Nothing, AbstractVector} = nothing
 ) where {T}
-    # Base cost
     cost = T(evaluate_stage_cost(obj.base.stage_cost, x, u, nothing, k)) * obj.base.scaling
-
     ρ = obj.ρ
 
-    # ── Private constraints ───────────────────────────────────────────────────
+    # Private constraints — player-local state
     for (j, pc) in enumerate(obj.private_constraints)
-        g = evaluate_constraint(pc.constraint, x, u, nothing, k)  # Vector{T}
+        g = evaluate_constraint(pc.constraint, x, u, nothing, k)
         λ = obj.λ_private[_priv_λ_range(obj, j)]
-
         if obj._priv_eq[j]
-            # Equality: always penalized — λᵀg + (ρ/2)‖g‖²
             cost += dot(λ, g) + (ρ/2) * dot(g, g)
         else
-            # Inequality: shifted clamp — (ρ/2) ‖max(0, g + λ/ρ)‖²
             shifted = g + λ / ρ
             active  = max.(shifted, zero(T))
             cost   += (ρ/2) * dot(active, active)
         end
     end
 
-    # ── Shared constraints ────────────────────────────────────────────────────
+    # Shared constraints — full joint state required
+    x_for_shared = isnothing(x_joint) ? x : x_joint
     for (j, sc) in enumerate(obj.shared_constraints)
-        g = evaluate_constraint(sc.constraint, x, u, nothing, k)
+        g = evaluate_constraint(sc.constraint, x_for_shared, u, nothing, k)
         λ = obj.λ_shared[_shared_λ_range(obj, j)]
-
         if obj._shared_eq[j]
             cost += dot(λ, g) + (ρ/2) * dot(g, g)
         else
@@ -323,12 +319,13 @@ function quadraticize(
     obj::ALAugmentedObjective{T},
     x_ref::AbstractVector,
     u_ref::AbstractVector,
-    k::Int
+    k::Int;
+    x_joint::Union{Nothing, AbstractVector} = nothing,
+    player_state_cols::Union{Nothing, UnitRange{Int}} = nothing
 ) where {T}
-    # ── Step 1: base quadraticization ─────────────────────────────────────────
+    # ── Step 1: base quadraticization (uses player-local x_ref) ──────────────
     Q, R, M, q, r, c = quadraticize(obj.base.stage_cost, x_ref, u_ref, k)
 
-    # Copy into mutable arrays — base may return aliased views (e.g. LQStageCost identity)
     Q = Matrix{T}(Q)
     R = Matrix{T}(R)
     M = Matrix{T}(M)
@@ -338,29 +335,39 @@ function quadraticize(
 
     ρ = obj.ρ
 
-    # ── Step 2: private constraint contributions ──────────────────────────────
+    # ── Step 2: private constraint contributions (player-local state) ─────────
     for (j, pc) in enumerate(obj.private_constraints)
         g  = evaluate_constraint(pc.constraint, x_ref, u_ref, nothing, k)
         λj = obj.λ_private[_priv_λ_range(obj, j)]
         Jx, Ju = constraint_jacobian(pc.constraint, x_ref, u_ref, nothing, k)
-
         _add_al_quadratic_update!(Q, R, M, q, r, g, λj, Jx, Ju, ρ, obj._priv_eq[j])
     end
 
-    # ── Step 3: shared constraint contributions ───────────────────────────────
-    for (j, sc) in enumerate(obj.shared_constraints)
-        g  = evaluate_constraint(sc.constraint, x_ref, u_ref, nothing, k)
-        λj = obj.λ_shared[_shared_λ_range(obj, j)]
-        Jx, Ju = constraint_jacobian(sc.constraint, x_ref, u_ref, nothing, k)
+    # ── Step 3: shared constraint contributions (joint state required) ────────
+    x_for_shared = isnothing(x_joint) ? x_ref : x_joint
 
-        _add_al_quadratic_update!(Q, R, M, q, r, g, λj, Jx, Ju, ρ, obj._shared_eq[j])
+    for (j, sc) in enumerate(obj.shared_constraints)
+        g  = evaluate_constraint(sc.constraint, x_for_shared, u_ref, nothing, k)
+        λj = obj.λ_shared[_shared_λ_range(obj, j)]
+        Jx_full, Ju = constraint_jacobian(sc.constraint, x_for_shared, u_ref, nothing, k)
+
+        # For separable dynamics, Q is (nᵢ × nᵢ) but Jx_full is (n_c × n_joint).
+        # Slice the columns corresponding to player i's state block for the Hessian
+        # update. The gradient update q uses only the player-local rows, so jx_i
+        # has the right length to accumulate into q (nᵢ,).
+        if !isnothing(player_state_cols)
+            Jx_local = Jx_full[:, player_state_cols]
+        else
+            Jx_local = Jx_full
+        end
+
+        _add_al_quadratic_update!(Q, R, M, q, r, g, λj, Jx_local, Ju, ρ, obj._shared_eq[j])
     end
 
     # ── Symmetrize ────────────────────────────────────────────────────────────
     Q = (Q + Q') / 2
     R = (R + R') / 2
 
-    # Regularize R if rank-1 updates have damaged positive definiteness
     λ_min_R = minimum(real.(eigvals(Symmetric(R))))
     if λ_min_R < 0
         ε = -λ_min_R + sqrt(eps(T))
@@ -488,34 +495,37 @@ Returns the ‖Δλ‖_∞ for convergence checking.
 """
 function update_multipliers!(
     obj::ALAugmentedObjective{T},
-    op::OperatingPoint{T}
+    op::OperatingPoint{T},
+    game::Union{Nothing, GameProblem} = nothing
 ) where {T}
-    N   = length(op.x) - 1
-    ρ   = obj.ρ
-    i   = obj.base.player_id
+    N      = length(op.x) - 1
+    ρ      = obj.ρ
+    i      = obj.base.player_id
     Δλ_max = zero(T)
+
+    # Determine whether to slice state for this player
+    is_sep = !isnothing(game) && game.dynamics isa SeparableDynamics
+    state_offset = is_sep ? game.metadata.state_offsets[i] : 0
+    state_dim_i  = is_sep ? game.metadata.state_dims[i]    : 0
 
     for (j, pc) in enumerate(obj.private_constraints)
         rng = _priv_λ_range(obj, j)
         dim = obj._priv_dims[j]
-        ḡ   = zeros(T, dim)
+        g_max = fill(T(-Inf), dim)
 
-        # Time-average constraint violation over trajectory
         for k in 1:N
-            x_k = op.x[k]
+            x_k = is_sep ? op.x[k][state_offset+1 : state_offset+state_dim_i] : op.x[k]
             u_k = op.u[i][k]
-            ḡ .+= evaluate_constraint(pc.constraint, x_k, u_k, nothing, k)
+            g_k = evaluate_constraint(pc.constraint, x_k, u_k, nothing, k)
+            g_max .= max.(g_max, g_k)
         end
-        ḡ ./= N
 
         λ_old = copy(obj.λ_private[rng])
-
         if obj._priv_eq[j]
-            obj.λ_private[rng] .+= ρ .* ḡ
+            obj.λ_private[rng] .+= ρ .* g_max
         else
-            obj.λ_private[rng] .= max.(zero(T), obj.λ_private[rng] .+ ρ .* ḡ)
+            obj.λ_private[rng] .= max.(zero(T), obj.λ_private[rng] .+ ρ .* g_max)
         end
-
         Δλ_max = max(Δλ_max, maximum(abs.(obj.λ_private[rng] .- λ_old)))
     end
 
@@ -553,28 +563,32 @@ function update_shared_multipliers!(
         rng     = state._shared_offsets[j] : state._shared_offsets[j] + state._shared_dims[j] - 1
         dim     = state._shared_dims[j]
         players = sc.players
-        ḡ       = zeros(T, dim)
 
-        # Average violation over trajectory and over involved players
+        # Use worst-case (max) violation over trajectory, not time-average.
+        # Averaging masks instantaneous violations: agents that are far apart
+        # at t=0 and t=T but collide at t=T/2 show avg g ≈ 0 despite violation.
+        g_max = fill(T(-Inf), dim)
         for i in players
             for k in 1:N
                 x_k = op.x[k]
                 u_k = op.u[i][k]
-                ḡ .+= evaluate_constraint(sc.constraint, x_k, u_k, nothing, k)
+                g_k = evaluate_constraint(sc.constraint, x_k, u_k, nothing, k)
+                g_max .= max.(g_max, g_k)
             end
         end
-        ḡ ./= (length(players) * N)
 
         λ_old = copy(state.λ_shared[rng])
 
         if state._shared_eq[j]
-            state.λ_shared[rng] .+= state.ρ .* ḡ
+            state.λ_shared[rng] .+= state.ρ .* g_max
+            active_viol = maximum(abs.(g_max))
         else
-            state.λ_shared[rng] .= max.(zero(T), state.λ_shared[rng] .+ state.ρ .* ḡ)
+            state.λ_shared[rng] .= max.(zero(T), state.λ_shared[rng] .+ state.ρ .* g_max)
+            active_viol = maximum(max.(g_max, zero(T)))
         end
 
         Δλ_max          = max(Δλ_max, maximum(abs.(state.λ_shared[rng] .- λ_old)))
-        total_violation = max(total_violation, maximum(abs.(ḡ)))
+        total_violation = max(total_violation, active_viol)
     end
 
     return Δλ_max, total_violation
