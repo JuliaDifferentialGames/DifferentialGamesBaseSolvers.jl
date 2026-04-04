@@ -150,6 +150,7 @@ struct PANGOLIN <: GameSolver
     max_line_search_iter::Int
     α_init::Float64
     α_step::Float64
+    armijo_param::Float64          # β: sufficient decrease parameter ∈ (0, 0.5]
     convergence_tol::Float64
     max_elwise_diff_step::Float64
     state_regularization::Float64
@@ -163,11 +164,12 @@ struct PANGOLIN <: GameSolver
 
     function PANGOLIN(;
         max_iter::Int               = 200,
-        max_line_search_iter::Int   = 20,
+        max_line_search_iter::Int   = 30,
         α_init::Float64             = 0.5,
         α_step::Float64             = 0.5,
+        armijo_param::Float64       = 1e-4,   # β: small value works well in practice
         convergence_tol::Float64    = 1e-3,
-        max_elwise_diff_step::Float64 = 0.0,   # 0 → auto: 30 * convergence_tol
+        max_elwise_diff_step::Float64 = 0.0,
         state_regularization::Float64  = 0.0,
         control_regularization::Float64 = 0.0,
         constraint_opts::ALOptions{Float64} = ALOptions(),
@@ -181,16 +183,15 @@ struct PANGOLIN <: GameSolver
         @assert max_line_search_iter > 0
         @assert 0 < α_init <= 1
         @assert 0 < α_step <= 1
+        @assert 0 < armijo_param < 0.5  "armijo_param β must be in (0, 0.5)"
         @assert convergence_tol > 0
         @assert init_mode in (:zero_control, :straight_line, :warmstart)
 
-        # Auto-compute max_elwise_diff_step if not provided.
-        # iLQGames.jl uses 30 * max_elwise_diff_converged; expose for problem-scale tuning.
         step_limit = max_elwise_diff_step > 0 ? max_elwise_diff_step : 30.0 * convergence_tol
 
         new(
             max_iter, max_line_search_iter,
-            α_init, α_step,
+            α_init, α_step, armijo_param,
             convergence_tol, step_limit,
             state_regularization, control_regularization,
             constraint_opts, init_mode,
@@ -259,6 +260,10 @@ function solve_lq_game!(
         q_k = [lqg.q[i][k]                   for i in 1:n_p]
         r_k = [lqg.r[i][k]                   for i in 1:n_p]
 
+        # Schur complement S = Σᵢ(Rᵢ + Bᵢ'ZᵢBᵢ) — built below before solve.
+        # LM regularization is applied to S directly (not Q) to bound gain magnitude.
+        # This is equivalent to Levenberg-Marquardt trust-region on the gain solve.
+
         B_k = hcat([lqg.B[i][k] for i in 1:n_p]...)   # (n × total_controls)
 
         # ── Coupled S matrix and RHS ─────────────────────────────────────────
@@ -294,9 +299,19 @@ function solve_lq_game!(
             end
         end
 
+        # ── Levenberg-Marquardt regularization on S ───────────────────────────
+        # Adds state_reg * I to S, bounding ‖P‖ ≤ ‖YP‖ / state_reg.
+        # More effective than Q regularization for gain magnitude control
+        # because P = S⁻¹ * YP and S is the gain-determining matrix.
+        if state_reg > 0
+            for d in 1:total_controls
+                S[d, d] += state_reg
+            end
+        end
+
         # ── Solve for gains ───────────────────────────────────────────────────
-        P_full = S \ YP    # (total_controls × n)
-        α_full = S \ Yα    # (total_controls,)
+        P_full = S \ YP
+        α_full = S \ Yα
 
         for i in 1:n_p
             copyto!(strat.P[i][k], P_full[ctrl_ranges[i], :])
@@ -393,46 +408,69 @@ function _step_dynamics(dyn::SeparableDynamics, x::Vector, us::Vector{<:Vector},
 end
 
 # ============================================================================
-# backtrack_scale!
+# backtrack_scale! — deviation-based line search with adaptive step scaling
 # ============================================================================
 
 """
-    backtrack_scale!(strat, op, last_op, game, solver, x0) -> Bool
+    backtrack_scale!(strat, op, last_op, game, al_objs, solver, x0;
+                     first_iter, sf_init) -> (Bool, Float64)
 
-Armijo line search on feed-forward term α. Mirrors iLQGames.jl exactly:
-first step scales by `α_init`, subsequent steps by `α_step`. Returns `false`
-if no stable rollout found within `max_line_search_iter` attempts.
+Line search on the feed-forward term α using a **trajectory-deviation criterion**:
+accept the first scale factor sf for which the rollout satisfies
+‖x_new(k) - x_ref(k)‖_∞ < max_elwise_diff_step for all k.
+
+# Why not Armijo cost-decrease?
+In a noncooperative game, players have conflicting costs {Jᵢ}. There is no
+single merit function whose decrease guarantees progress. The iLQGames paper
+(Fridovich-Keil et al., 2020, Section IV-A) explicitly notes this:
+  "line-searching to decrease 'cost' does not make sense, as costs {Jᵢ}
+   may conflict."
+Furthermore, the AL penalty cost increases with ρ even as the trajectory
+improves toward constraint satisfaction, so any cost-based criterion would
+reject valid steps after ρ starts growing. The deviation criterion directly
+checks that the new operating point stays close to the linearization point,
+which is the condition required for the iLQ approximation to be valid.
+
+# Adaptive initial scale
+sf_adapt tracks the scale accepted on the previous iteration:
+- If accepted on first attempt → try a bolder step next time (×1.5, capped)
+- If backtracking was needed → hold the last accepted scale
 """
 function backtrack_scale!(
     strat::FeedbackStrategy{T},
     op::OperatingPoint{T},
     last_op::OperatingPoint{T},
     game::GameProblem{T},
+    al_objs,            # unused — kept for call-site compatibility
     solver::PANGOLIN,
     x0::Vector{T};
-    first_iter::Bool = false
+    first_iter::Bool = false,
+    sf_init::T = T(solver.α_init)
 ) where {T}
     max_dev = T(solver.max_elwise_diff_step)
     N       = length(op.x) - 1
     n_p     = game.n_players
 
+    sf = sf_init
     for i in 1:solver.max_line_search_iter
-        sf = (i == 1) ? T(solver.α_init) : T(solver.α_step)
-        scale_feedforward!(strat, sf)
+        if i == 1
+            scale_feedforward!(strat, sf)
+        else
+            scale_feedforward!(strat, T(solver.α_step))
+            sf *= T(solver.α_step)
+        end
 
-        # Reset op to last_op so deviation check has the correct reference
         for k in 1:N+1; op.x[k] .= last_op.x[k]; end
         for p in 1:n_p, k in 1:N; op.u[p][k] .= last_op.u[p][k]; end
 
-        # Skip deviation check only on the very first outer iteration where
-        # last_op was built with a zero strategy and any nonzero gains will
-        # produce a large apparent deviation. On all subsequent iterations,
-        # enforce the deviation limit to prevent the line search from accepting
-        # arbitrarily large steps that cause the operating point to cycle.
+        # On the very first outer iteration, last_op was built with the zero
+        # strategy while strat now has real gains — any nonzero gains produce
+        # an apparent large deviation from the zero-control trajectory. Skip
+        # the deviation check on the very first attempt of the very first iter.
         dev = (first_iter && i == 1) ? T(Inf) : max_dev
-        rollout!(op, game, strat, x0; max_deviation=dev) && return true
+        rollout!(op, game, strat, x0; max_deviation=dev) && return (true, sf)
     end
-    return false
+    return (false, zero(T))
 end
 
 # ============================================================================
@@ -542,6 +580,7 @@ function _build_al_objectives(
     al_state::ALSolverState{T},
     opts::ALOptions{T}
 ) where {T}
+    N   = n_steps(game)
     n_p = game.n_players
     objs = Vector{ALAugmentedObjective}(undef, n_p)
     for i in 1:n_p
@@ -549,8 +588,14 @@ function _build_al_objectives(
                                                    game.private_constraints))
         shared = Vector{SharedConstraint}(filter(sc -> i in sc.players,
                                                   game.shared_constraints))
+        # Build the subset of λ_shared_traj matrices relevant to this player's
+        # shared constraints. The ordering in al_state matches game.shared_constraints;
+        # filter to the same indices that matched `shared` above.
+        shared_idxs    = findall(sc -> i in sc.players, game.shared_constraints)
+        λ_shared_traj_i = al_state.λ_shared_traj[shared_idxs]
+
         objs[i] = ALAugmentedObjective(game.objectives[i], priv, shared,
-                                        al_state.λ_shared, opts)
+                                        λ_shared_traj_i, N, opts)
     end
     return objs
 end
@@ -584,7 +629,7 @@ function _solve(
 
     # ── AL setup ──────────────────────────────────────────────────────────────
     opts     = solver.constraint_opts
-    al_state = ALSolverState(Vector{SharedConstraint}(game.shared_constraints), opts)
+    al_state = ALSolverState(Vector{SharedConstraint}(game.shared_constraints), opts, N)
     al_objs  = _build_al_objectives(game, al_state, opts)
 
     # ── Initialize operating point ─────────────────────────────────────────────
@@ -607,6 +652,7 @@ function _solve(
     ρ_hist         = Vector{T}()
     converged      = false
     i_iter         = 0
+    sf_adapt       = T(solver.α_init)   # adaptive initial scale for line search
     t_start        = time()
 
     verbose && @info "PANGOLIN: starting" n_players=n_p N=N max_iter=solver.max_iter constrained=!is_unconstrained(game)
@@ -624,18 +670,33 @@ function _solve(
         # 2. Backward DP
         solve_lq_game!(strat, lqg, solver)
 
-        # 3. Save last_op, line search
+        # 3. Save last_op, Armijo line search with adaptive scaling
         for k in 1:N+1; last_op.x[k] .= current_op.x[k]; end
         for i in 1:n_p, k in 1:N; last_op.u[i][k] .= current_op.u[i][k]; end
 
-        success = backtrack_scale!(strat, current_op, last_op, game, solver, x0;
-                                   first_iter = (i_iter == 0))
+        objs_for_ls = is_unconstrained(game) ? nothing : al_objs
+        success, sf_accepted = backtrack_scale!(
+            strat, current_op, last_op, game, objs_for_ls, solver, x0;
+            first_iter = (i_iter == 0),
+            sf_init    = sf_adapt
+        )
+
         if !success
             verbose && @warn "PANGOLIN: line search failed at iter $i_iter"
+            for k in 1:N+1; current_op.x[k] .= last_op.x[k]; end
+            for i in 1:n_p, k in 1:N; current_op.u[i][k] .= last_op.u[i][k]; end
             break
         end
 
-        # 4 & 5. Dual update + penalty schedule
+        # Adapt initial scale for next iteration:
+        # if accepted on first try → be bolder; otherwise hold current scale
+        if sf_accepted ≥ sf_adapt * T(0.99)
+            sf_adapt = min(T(solver.α_init), sf_adapt * T(1.5))
+        else
+            sf_adapt = sf_accepted
+        end
+
+        # 4. Dual update (standard AL dual ascent, ALGAMES Eq. 10)
         if !is_unconstrained(game)
             for i in 1:n_p
                 update_multipliers!(al_objs[i], current_op, game)
@@ -645,15 +706,17 @@ function _solve(
                 Vector{SharedConstraint}(game.shared_constraints),
                 al_objs, current_op
             )
-            maybe_update_penalty!(al_state, al_objs, viol)
             push!(violation_hist, viol)
             push!(ρ_hist, al_state.ρ)
+
+            # 5. Unconditional penalty increase (ALGAMES Eq. 11)
+            update_penalty!(al_state, al_objs)
         else
             push!(violation_hist, zero(T))
             push!(ρ_hist, zero(T))
         end
 
-        # 6. Convergence
+        # 6. Convergence check
         converged = has_converged(current_op, last_op, T(solver.convergence_tol))
 
         push!(iter_costs, _trajectory_costs(game, current_op))
@@ -777,6 +840,12 @@ function _lq_approx_al!(
 end
 
 function _trajectory_costs(game::GameProblem{T}, op::OperatingPoint{T}) where {T}
+    # Evaluates true (unpenalized) trajectory costs for logging.
+    # Stage costs are evaluated at every timestep k = 1:N — this includes both
+    # running state costs (e.g., goal-tracking Q(x_k - x_f)) and control costs.
+    # Terminal costs are evaluated at x(N+1).
+    # Both cost types are defined by the PlayerObjective; the solver does not
+    # distinguish between them structurally — it respects whatever the user provides.
     N   = length(op.x) - 1
     n_p = game.n_players
     costs = zeros(T, n_p)

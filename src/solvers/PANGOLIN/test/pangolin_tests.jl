@@ -521,43 +521,47 @@ end
 @testset "L10 — ALAugmentedObjective" begin
 
     n, m = 4, 2
+    N_test = 10   # test horizon
 
     function _make_al_obj(T=Float64)
-        game    = constrained_lti_game(T)
-        opts    = ALOptions()
+        game     = constrained_lti_game(T)
+        opts     = ALOptions()
+        N        = n_steps(game)
         al_state = ALSolverState(
-            Vector{SharedConstraint}(game.shared_constraints), opts
+            Vector{SharedConstraint}(game.shared_constraints), opts, N
         )
         priv   = Vector{PrivateConstraint}(filter(pc -> pc.player == 1, game.private_constraints))
         shared = SharedConstraint[]
-        ALAugmentedObjective(game.objectives[1], priv, shared, al_state.λ_shared, opts)
+        ALAugmentedObjective(game.objectives[1], priv, shared,
+                             al_state.λ_shared_traj, N, opts)
     end
 
-    @testset "construction: correct multiplier dimensions" begin
+    @testset "construction: correct multiplier structure" begin
         obj = _make_al_obj()
-        # BoundConstraint on m=2 control: 2*m = 4 multipliers
-        @test length(obj.λ_private) == 2 * m
-        @test all(obj.λ_private .== 0.0)
-        @test obj.ρ == 1.0   # ρ_init default
+        game = constrained_lti_game()
+        N    = n_steps(game)
+        # BoundConstraint on m=2 control: 2*m = 4 constraints per timestep
+        @test length(obj.λ_private) == 1        # one private constraint block
+        @test size(obj.λ_private[1]) == (2*m, N)
+        @test all(obj.λ_private[1] .== 0.0)
+        @test obj.ρ == 1.0
     end
 
     @testset "augmented_stage_cost: no constraint active → equals base cost" begin
         obj   = _make_al_obj()
-        game  = constrained_lti_game()
         x     = zeros(4)
-        u_feasible = zeros(2)   # u=0 satisfies u ≤ 0.5
+        u_feas = zeros(2)
         k     = 1
-        base_cost = evaluate_stage_cost(obj.base.stage_cost, x, u_feasible, nothing, k)
-        al_cost   = augmented_stage_cost(obj, x, u_feasible, k)
-        # With u feasible and λ=0, shifted = g + 0 = g ≤ 0, inactive → cost unchanged
+        base_cost = evaluate_stage_cost(obj.base.stage_cost, x, u_feas, nothing, k)
+        al_cost   = augmented_stage_cost(obj, x, u_feas, k)
         @test al_cost ≈ base_cost * obj.base.scaling atol=1e-10
     end
 
     @testset "augmented_stage_cost: active constraint increases cost" begin
-        obj   = _make_al_obj()
-        x     = zeros(4)
-        u_viol = fill(1.0, 2)   # u = 1.0 > 0.5 upper bound — violated
-        k     = 1
+        obj    = _make_al_obj()
+        x      = zeros(4)
+        u_viol = fill(1.0, 2)
+        k      = 1
         base_cost = evaluate_stage_cost(obj.base.stage_cost, x, u_viol, nothing, k)
         al_cost   = augmented_stage_cost(obj, x, u_viol, k)
         @test al_cost > base_cost * obj.base.scaling
@@ -570,8 +574,7 @@ end
 
     n, m = 2, 2
 
-    function _simple_al_obj(; u_max=0.5, ρ=1.0, λ_val=0.0, T=Float64)
-        # 1-player game with bound constraint on u
+    function _simple_al_obj(; u_max=0.5, ρ=1.0, λ_val=0.0, T=Float64, N=10)
         A  = T(0.9) * Matrix{T}(I, n, n)
         B  = [Matrix{T}(I, n, m)]
         Q  = [Matrix{T}(I, n, n)]
@@ -580,21 +583,18 @@ end
         x0 = ones(T, n)
         bound = BoundConstraint(fill(T(-10), m), fill(T(u_max), m); applies_to=:u)
         pc    = PrivateConstraint(bound, 1)
-        dyn   = LinearDynamics(A, B)
         obj   = PlayerObjective(1, LQStageCost(Q[1], R[1]), LQTerminalCost(Qf[1]))
         opts  = ALOptions(; ρ_init=T(ρ))
-        al_state = ALSolverState(SharedConstraint[], opts)
-        al_obj = ALAugmentedObjective(obj, [pc], SharedConstraint[], al_state.λ_shared, opts)
+        λ_shared_traj = Matrix{T}[]   # no shared constraints
+        al_obj = ALAugmentedObjective(obj, [pc], SharedConstraint[], λ_shared_traj, N, opts)
         al_obj.ρ = T(ρ)
-        fill!(al_obj.λ_private, T(λ_val))
+        fill!(al_obj.λ_private[1], T(λ_val))
         return al_obj
     end
 
     @testset "inactive constraint: AL quadraticize = base quadraticize" begin
         al_obj = _simple_al_obj(; u_max=0.5, ρ=1.0, λ_val=0.0)
-        x_ref  = zeros(n)
-        u_ref  = zeros(m)   # u=0 ≤ 0.5 — inactive
-        k      = 1
+        x_ref  = zeros(n); u_ref = zeros(m); k = 1
         Q_al, R_al, _, _, _, _ = quadraticize(al_obj, x_ref, u_ref, k)
         Q_base, R_base, _, _, _, _ = quadraticize(al_obj.base.stage_cost, x_ref, u_ref, k)
         @test Q_al ≈ Matrix(Q_base) atol=1e-10
@@ -603,12 +603,9 @@ end
 
     @testset "active constraint: R increases (rank-1 update from active bound)" begin
         al_obj = _simple_al_obj(; u_max=0.0, ρ=10.0, λ_val=0.0)
-        x_ref  = zeros(n)
-        u_ref  = ones(m) * 0.5   # u > 0 = u_max — all upper bounds active
-        k      = 1
+        x_ref  = zeros(n); u_ref = ones(m) * 0.5; k = 1
         _, R_al, _, _, _, _ = quadraticize(al_obj, x_ref, u_ref, k)
         _, R_base, _, _, _, _ = quadraticize(al_obj.base.stage_cost, x_ref, u_ref, k)
-        # Active constraint adds ρ · I to R (for bound constraint, Jᵘ = I)
         R_expected = Matrix(R_base) + 10.0 * Matrix{Float64}(I, m, m)
         @test R_al ≈ R_expected atol=1e-8
     end
@@ -618,30 +615,31 @@ end
 # ─────────────────────────────────────────────────────────────────────────────
 @testset "L12 — update_multipliers!" begin
 
-    @testset "inequality: λ clamped to ≥ 0" begin
+    function _make_constrained_al_obj()
         game     = constrained_lti_game()
         opts     = ALOptions(; ρ_init=1.0)
-        al_state = ALSolverState(SharedConstraint[], opts)
+        N        = n_steps(game)
+        al_state = ALSolverState(SharedConstraint[], opts, N)
         priv     = Vector{PrivateConstraint}(filter(pc->pc.player==1, game.private_constraints))
-        al_obj   = ALAugmentedObjective(game.objectives[1], priv, SharedConstraint[], al_state.λ_shared, opts)
+        ALAugmentedObjective(game.objectives[1], priv, SharedConstraint[],
+                             al_state.λ_shared_traj, N, opts)
+    end
 
-        # Create an operating point where u₁ ≡ 0 (feasible — constraint not active)
-        op = OperatingPoint(game)
-
-        # Start with negative λ — after update should be clamped to 0 or positive
-        fill!(al_obj.λ_private, -5.0)
+    @testset "inequality: λ clamped to ≥ 0 at all timesteps" begin
+        al_obj = _make_constrained_al_obj()
+        game   = constrained_lti_game()
+        op     = OperatingPoint(game)
+        # Set all private multipliers to -5
+        fill!(al_obj.λ_private[1], -5.0)
         update_multipliers!(al_obj, op)
-        # u=0 satisfies u ≤ 0.5, so g = 0 - 0.5 = -0.5 < 0; update: max(0, -5 + ρ*(-0.5))
-        @test all(al_obj.λ_private .>= 0.0)
+        # u=0 satisfies u ≤ 0.5; update clamps to max(0, -5 + ρ*g) = 0
+        @test all(al_obj.λ_private[1] .>= 0.0)
     end
 
     @testset "Δλ return value is non-negative" begin
-        game     = constrained_lti_game()
-        opts     = ALOptions(; ρ_init=1.0)
-        al_state = ALSolverState(SharedConstraint[], opts)
-        priv     = Vector{PrivateConstraint}(filter(pc->pc.player==1, game.private_constraints))
-        al_obj   = ALAugmentedObjective(game.objectives[1], priv, SharedConstraint[], al_state.λ_shared, opts)
-        op       = OperatingPoint(game)
+        al_obj = _make_constrained_al_obj()
+        game   = constrained_lti_game()
+        op     = OperatingPoint(game)
         Δλ = update_multipliers!(al_obj, op)
         @test Δλ >= 0.0
     end
@@ -653,8 +651,8 @@ end
 
     function _make_al_state(T=Float64)
         opts = ALOptions(; ρ_init=T(1.0), ρ_max=T(1e4), φ=T(10.0), violation_tol=T(0.25))
-        al_state = ALSolverState(SharedConstraint[], opts)
-        objs = ALAugmentedObjective[]   # empty — no players needed for schedule test
+        al_state = ALSolverState(SharedConstraint[], opts, 10)
+        objs = ALAugmentedObjective[]
         return al_state, objs, opts
     end
 
