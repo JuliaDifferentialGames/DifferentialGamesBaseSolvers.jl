@@ -2,6 +2,7 @@ module DifferentialGamesBaseSolvers
 
 using LinearAlgebra
 using DifferentialGamesBase
+using Printf
 
 # Import everything needed for method extension and type use.
 # GameSolver and solve are defined in DGB/solve.jl — import to extend.
@@ -16,8 +17,15 @@ import DifferentialGamesBase:
 # Solvers
 # ============================================================================
 
+# LQ Games
 include("solvers/FNELQ/src/fnelq.jl")
+
+# iLQGames
 include("solvers/iLQGames/src/ilqgames.jl")
+
+# ALGAMES
+include("solvers/ALGAMES/src/algames.jl")
+include("solvers/ALGAMES/src/utils.jl")
 
 # ============================================================================
 # Visualisation stubs (implementations live in the Plots weak-dep extension)
@@ -76,6 +84,7 @@ end
 
 export FNELQ
 export iLQGames
+export ALGAMES
 export animate_solution
 export save_animation
 
