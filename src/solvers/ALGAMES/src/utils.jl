@@ -363,15 +363,20 @@ function _G_into!(G ::AbstractVector{S},
         x_k1 = ws.X[:, k+1]
         u_k  = U_flat[:, k]
 
-        # ── Dynamics Jacobian at step k ───────────────────────────────────
-        # Ak   : (n × n)       ∂f/∂x(k)   — used as Aₖᵀ below
-        # Bk   : (n × m_total) ∂f/∂u(k)   — used as Bᵢₖᵀ below
-        Ak, Bk = _dyn_jac(game.dynamics, x_k, u_k, n, k)
+        # ── Discrete dynamics step and residual ──────────────────────────
+        # D_k = x_next(x_k, u_k) − x(k+1)
+        # For LinearDynamics: x_next = A x + B u  (exact discrete map).
+        # For continuous dynamics: x_next = RK4(f, x_k, u_k, dt).
+        # Using the same _discrete_step in the Jacobian (via _dyn_jac_discrete)
+        # ensures the residual and its derivative are consistent.
+        dt   = S(game.time_horizon.dt)
+        f_k  = _discrete_step(game.dynamics, x_k, u_k, nothing, k, dt)
+        D_k  = f_k .- x_k1
 
-        # ── Dynamics residual ─────────────────────────────────────────────
-        # D_k = f(x_k, u_k) − x(k+1)   (reference: discrete_dynamics − xk1)
-        f_k   = evaluate_dynamics(game.dynamics, x_k, u_k, nothing, k)
-        D_k   = f_k .- x_k1
+        # ── Discrete dynamics Jacobian ∂x_next/∂x and ∂x_next/∂u ─────────
+        # TRANSPOSE AUDIT: Ak = ∂x_next/∂x, Bk = ∂x_next/∂u.
+        # Only Aₖᵀ and Bᵢₖᵀ appear in the residual — never plain Aₖ.
+        Ak, Bk = _dyn_jac_discrete(game.dynamics, x_k, u_k, n, k, dt)
 
         # ── Constraint evaluation and AL penalty ──────────────────────────
         C_k, Jcx_k, Jcu_k = _con_eval(game, ws, x_k, u_k, k)
@@ -384,12 +389,42 @@ function _G_into!(G ::AbstractVector{S},
             u_rng_i  = coff[i]+1 : coff[i]+mi
             obj_i    = get_objective(game, i)
 
-            # Compute both gradients in one call (avoids evaluating the cost twice)
-            gx_ik, gu_ik = stage_cost_gradient(
-                obj_i.stage_cost, x_k, u_k[u_rng_i], nothing, k
+            # State slice for player i's cost evaluation.
+            #
+            # LQGameProblem (shared-state, LinearDynamics):
+            #   metadata.state_dims = [n], state_offsets = [0]
+            #   → every player's cost was built against the full joint state
+            #   → s_rng_i = 1:n, x_state_i = x_k
+            #
+            # PDGNEProblem (SeparableDynamics, DifferentialGame):
+            #   metadata.state_dims = [n₁, n₂, ...], state_offsets = [0, n₁, ...]
+            #   → player i's cost was built against nᵢ-dimensional private state
+            #   → s_rng_i = soff_i+1 : soff_i+nᵢ
+            #
+            # We detect which case we are in by checking whether state_dims has
+            # one entry (shared) or np entries (separable).
+            if length(game.metadata.state_dims) == np
+                # Separable: per-player private state
+                sdim_i  = game.metadata.state_dims[i]
+                soff_i  = game.metadata.state_offsets[i]
+            else
+                # Shared: all players see the full joint state
+                sdim_i = n
+                soff_i = 0
+            end
+            s_rng_i    = soff_i+1 : soff_i+sdim_i
+            x_state_i  = x_k[s_rng_i]    # (nᵢ,) slice for cost evaluation
+            x1_state_i = x_k1[s_rng_i]   # (nᵢ,) slice for terminal cost
+
+            # Compute both cost gradients against the correct state slice.
+            # gx_ik_local is (nᵢ,): ∂J^i/∂xᵢ(k).
+            # We embed it back into a full-n vector (zeros elsewhere) so it can
+            # be added to the length-n G rows which represent the full joint state.
+            gx_ik_local, gu_ik = stage_cost_gradient(
+                obj_i.stage_cost, x_state_i, u_k[u_rng_i], nothing, k
             )
-            # gx_ik : (n,)   ∂J^i/∂x(k)    — goes to x(k) row
-            # gu_ik : (mᵢ,)  ∂J^i/∂u^i(k)  — goes to u^i(k) row
+            gx_ik          = zeros(S, n)
+            gx_ik[s_rng_i] .= gx_ik_local
 
             # ── G^i_{u^i(k)} row ────────────────────────────────────────────
             # = ∂J^i/∂u^i(k) + Bᵢₖᵀ λᵢₖ + Jcuᵢᵀ pen_k
@@ -414,7 +449,9 @@ function _G_into!(G ::AbstractVector{S},
             # ── Terminal cost gradient at x(N+1) (k=N only) ─────────────────
             # ∂Φ^i/∂x(N+1): added to the x(N+1) row = _Gx_idx(ws,i,N)
             if k == N
-                gx_term = terminal_cost_gradient(obj_i.terminal_cost, x_k1, nothing)
+                gx_term_local = terminal_cost_gradient(obj_i.terminal_cost, x1_state_i, nothing)
+                gx_term        = zeros(S, n)
+                gx_term[s_rng_i] .= gx_term_local
                 @views G[_Gx_idx(ws, i, N)] .+= gx_term
             end
         end
@@ -577,21 +614,24 @@ end
 # ============================================================================
 
 """
-    _dyn_jac(dyn, x_k, u_k, n, k) -> (Ak, Bk)
+    _dyn_jac_discrete(dyn, x_k, u_k, n, k, dt) -> (Ak, Bk)
 
-Returns ∂f/∂x (n×n) and ∂f/∂u (n×m_total).
-For LinearDynamics uses exact matrices; otherwise ForwardDiff.
+Returns ∂x_next/∂x (n×n) and ∂x_next/∂u (n×m_total) for the DISCRETE step.
 
-TRANSPOSE AUDIT: only Aₖᵀ and Bᵢₖᵀ appear in the residual.  This function
-returns the UN-transposed matrices.  All callers must transpose explicitly.
+For `LinearDynamics` (already discrete): exact matrices from `get_A`/`get_B_concatenated`.
+For continuous dynamics (`SeparableDynamics`, `CoupledNonlinearDynamics`): differentiate
+through `_rk4_step` via ForwardDiff — the same function used for the residual.
+
+This is the TRANSPOSE AUDIT point: only `Ak'` and `Bᵢₖ'` appear in the
+residual. This function returns the UN-transposed matrices. All callers transpose.
 """
-function _dyn_jac(dyn::LinearDynamics{T}, x_k, u_k, n::Int, k::Int) where {T}
+function _dyn_jac_discrete(dyn::LinearDynamics{T}, x_k, u_k, n::Int, k::Int, dt) where {T}
     return get_A(dyn, k), get_B_concatenated(dyn, k)
 end
 
-function _dyn_jac(dyn::DynamicsSpec{T}, x_k, u_k, n::Int, k::Int) where {T}
+function _dyn_jac_discrete(dyn::DynamicsSpec{T}, x_k, u_k, n::Int, k::Int, dt) where {T}
     J = ForwardDiff.jacobian(
-        z -> evaluate_dynamics(dyn, z[1:n], z[n+1:end], nothing, k),
+        z -> _discrete_step(dyn, z[1:n], z[n+1:end], nothing, k, dt),
         vcat(x_k, u_k)
     )
     return J[:, 1:n], J[:, n+1:end]
@@ -623,8 +663,22 @@ function _con_eval(game::GameProblem{T},
     Jcu_list = Matrix{S}[]
 
     for c in Iterators.flatten((game.private_constraints, game.shared_constraints))
-        cv     = evaluate_constraint(c, x_k, u_k, nothing, k)
-        Jx, Ju = constraint_jacobian(c, x_k, u_k, nothing, k)
+        cv = evaluate_constraint(c, x_k, u_k, nothing, k)
+
+        # Use ForwardDiff through evaluate_constraint for the Jacobian rather than
+        # calling constraint_jacobian(c, ...) directly.  Some constraints (e.g.
+        # ProximityConstraint) have analytical Jacobians that pre-allocate Float64
+        # output arrays and are not ForwardDiff-compatible when x_k/u_k carry
+        # dual numbers (as they do inside _build_jacobian!).  Differentiating
+        # through evaluate_constraint is always correct and type-compatible.
+        z = vcat(x_k, u_k)
+        J = ForwardDiff.jacobian(
+            z_var -> evaluate_constraint(c, z_var[1:n], z_var[n+1:end], nothing, k),
+            z
+        )
+        Jx = J[:, 1:n]
+        Ju = J[:, n+1:end]
+
         push!(C_list, cv);   push!(Jcx_list, Jx);   push!(Jcu_list, Ju)
     end
 
@@ -691,21 +745,44 @@ Stack all players' controls column-by-column.
 _concat_controls(ws::ALGAMESWorkspace) = vcat(ws.U...)
 
 """
-    _rollout_flat(dyn, x0, U, N) -> Matrix  (n × N+1)
+    _rollout_flat(dyn, x0, U, N, dt) -> Matrix  (n × N+1)
 
 Forward simulate `dyn` from `x0` under per-player controls `U`.
-Used for primal initialisation (zero controls → free rollout).
+- `LinearDynamics`: `evaluate_dynamics` is already a discrete map; use directly.
+- `SeparableDynamics`/`CoupledNonlinearDynamics`: `evaluate_dynamics` returns the
+  continuous RHS ẋ; integrate with RK4 over timestep `dt`.
 """
 function _rollout_flat(dyn::DynamicsSpec{T}, x0::Vector{T},
-                        U::Vector{Matrix{T}}, N::Int) where {T}
+                        U::Vector{Matrix{T}}, N::Int, dt::T = T(0.1)) where {T}
     n = length(x0)
     X = Matrix{T}(undef, n, N+1)
     X[:, 1] .= x0
     U_flat   = vcat(U...)
     for k in 1:N
-        X[:, k+1] .= evaluate_dynamics(dyn, X[:, k], U_flat[:, k], nothing, k)
+        X[:, k+1] .= _discrete_step(dyn, X[:, k], U_flat[:, k], nothing, k, dt)
     end
     return X
+end
+
+"""
+    _discrete_step(dyn, x, u, p, k, dt) -> x_next
+
+One discrete step of the dynamics, dispatching on type:
+- `LinearDynamics`: exact discrete map `x_next = Ax + Bu`, `dt` unused.
+- Continuous dynamics (`SeparableDynamics`, `CoupledNonlinearDynamics`):
+  RK4 integration over timestep `dt` with zero-order hold on u.
+  ForwardDiff-compatible: x and u may be dual numbers.
+"""
+_discrete_step(dyn::LinearDynamics, x, u, p, k::Int, dt) =
+    evaluate_dynamics(dyn, x, u, p, k)
+
+function _discrete_step(dyn::DynamicsSpec, x, u, p, k::Int, dt)
+    t = (k - 1) * dt
+    k1 = evaluate_dynamics(dyn, x,              u, p, t)
+    k2 = evaluate_dynamics(dyn, x .+ dt/2 .* k1, u, p, t + dt/2)
+    k3 = evaluate_dynamics(dyn, x .+ dt/2 .* k2, u, p, t + dt/2)
+    k4 = evaluate_dynamics(dyn, x .+ dt    .* k3, u, p, t + dt)
+    return x .+ (dt/6) .* (k1 .+ 2 .* k2 .+ 2 .* k3 .+ k4)
 end
 
 """

@@ -2,6 +2,7 @@ module DifferentialGamesBaseSolvers
 
 using LinearAlgebra
 using DifferentialGamesBase
+using ForwardDiff
 using Printf
 
 # Import everything needed for method extension and type use.
@@ -24,7 +25,7 @@ include("solvers/FNELQ/src/fnelq.jl")
 include("solvers/iLQGames/src/ilqgames.jl")
 
 # ALGAMES
-include("solvers/ALGAMES/src/algames.jl")
+include("solvers/ALGAMES/src/algames.jl")   
 include("solvers/ALGAMES/src/utils.jl")
 
 # ============================================================================

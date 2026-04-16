@@ -2,7 +2,10 @@
 # test_algames.jl
 #
 # Test suite for ALGAMES (algames.jl + utils.jl).
-# Run via:  include("test_algames.jl")  from a session that has DGB on LOAD_PATH.
+#
+# Run as part of the package test suite from runtests.jl, or standalone via:
+#   using DifferentialGamesBaseSolvers
+#   include("test_algames.jl")
 #
 # Categories (per CLAUDE.md guidelines):
 #   Cat 0 — Unit:        workspace allocation, packing, index helpers
@@ -17,6 +20,28 @@ using LinearAlgebra
 using ForwardDiff
 using DifferentialGamesBase
 using DifferentialGamesBaseSolvers
+
+# Bring internal ALGAMES names into test scope.
+# These are not part of the public API but are needed for Cat 0 unit tests
+# that verify workspace allocation, index helpers, and residual structure
+# directly.  All other categories only use the public solve() interface.
+import DifferentialGamesBaseSolvers:
+    ALGAMESWorkspace,
+    ALGAMESBuffers,
+    _y_dim,
+    _G_dim,
+    _x_idx,
+    _u_idx,
+    _λdyn_idx,
+    _Gx_idx,
+    _Gu_idx,
+    _Gdyn_idx,
+    _pack_y,
+    _unpack_y,
+    _build_residual!,
+    _build_jacobian!,
+    _G_from_y,
+    _apply_step!
 
 # ============================================================================
 # Problem factories

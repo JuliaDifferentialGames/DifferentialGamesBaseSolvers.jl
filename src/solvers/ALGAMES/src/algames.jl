@@ -179,7 +179,7 @@ function ALGAMESWorkspace(
         end
     end
 
-    X = _rollout_flat(game.dynamics, game.initial_state, U, N)
+    X = _rollout_flat(game.dynamics, game.initial_state, U, N, game.time_horizon.dt)
 
     # ── Constraint dimension ─────────────────────────────────────────────────
     nc_step   = _count_nc_step(game)
@@ -218,6 +218,21 @@ end
 # _solve  —  outer AL loop  (Algorithm 3)
 # ============================================================================
 
+# Concrete overload for GNEPSolution warmstart.
+# DGB's forwarding method (_solve(::GameProblem, ::GameSolver, ::GNEPSolution, ::Bool))
+# re-dispatches with a ::GameSolver-typed solver, which misses our concrete method.
+# This overload intercepts the GNEPSolution case at the concrete ::ALGAMES level
+# and converts to WarmstartData before calling the main method — matching the
+# pattern used by iLQGames and other solvers in this package.
+function _solve(
+    game     ::GameProblem{T},
+    solver   ::ALGAMES,
+    warmstart::GNEPSolution{T},
+    verbose  ::Bool
+) where {T}
+    _solve(game, solver, WarmstartData(warmstart), verbose)
+end
+
 """
     _solve(game, solver::ALGAMES, warmstart, verbose) -> GNEPSolution{T}
 
@@ -226,14 +241,11 @@ Main entry point.  See module docstring for algorithm description.
 function _solve(
     game     ::GameProblem{T},
     solver   ::ALGAMES,
-    warmstart::Union{Nothing, WarmstartData, GNEPSolution{T}},
+    warmstart::Union{Nothing, WarmstartData},
     verbose  ::Bool
 ) where {T}
-    # Normalise: GNEPSolution warmstart → WarmstartData
-    ws_data = warmstart isa GNEPSolution ? WarmstartData(warmstart) :
-              warmstart
     t_start = time()
-    ws  = ALGAMESWorkspace(game, solver, ws_data)
+    ws  = ALGAMESWorkspace(game, solver, warmstart)
 
     # G and y have the same length (see _G_dim == _y_dim in utils.jl).
     n_y = _y_dim(ws)
@@ -399,12 +411,25 @@ function _assemble_solution(
     N     = ws.N
     times = collect(range(T(0), th.tf, length = N + 1))
 
-    U_flat = _concat_controls(ws)
-
     trajectories = map(1:ws.np) do i
-        obj    = get_objective(game, i)
-        X_list = [ws.X[:, k]   for k in 1:N+1]
-        U_list = [U_flat[:, k] for k in 1:N]
+        obj = get_objective(game, i)
+
+        # LQStageCost expects x of exactly size(Q,1). For LQGameProblem (shared
+        # state), that is n (full joint state). For PDGNEProblem (SeparableDynamics),
+        # that is nᵢ (private state). Detect via metadata and slice accordingly.
+        if length(game.metadata.state_dims) == ws.np
+            # Separable: player i sees only its private state slice
+            sdim_i = game.metadata.state_dims[i]
+            soff_i = game.metadata.state_offsets[i]
+            srng_i = soff_i+1 : soff_i+sdim_i
+            X_list = [ws.X[srng_i, k] for k in 1:N+1]
+        else
+            # Shared state: full joint state
+            X_list = [ws.X[:, k] for k in 1:N+1]
+        end
+
+        # U_list must use player i's own controls (length mᵢ), not joint controls.
+        U_list = [ws.U[i][:, k] for k in 1:N]
         c_i    = total_cost(obj, X_list, U_list, nothing)
         Trajectory{T}(i, copy(ws.X), copy(ws.U[i]), times, c_i)
     end
