@@ -1,86 +1,82 @@
 module DifferentialGamesBaseSolvers
 
-# ============================================================================
-# Dependencies
-# ============================================================================
-
-# Core DifferentialGamesBase types — all game problem, dynamics, cost, and
-# solution types are re-exported from here; solvers never import them directly.
+using LinearAlgebra
 using DifferentialGamesBase
 
-# Extend the solve/_solve dispatch from DifferentialGamesBase
-import DifferentialGamesBase: solve, _solve
-
-# AD and results — required by quadraticization.jl (DiffResults single-pass)
-using ForwardDiff
-using DiffResults
-
-# Standard library
-using LinearAlgebra
-using SparseArrays
+# Import everything needed for method extension and type use.
+# GameSolver and solve are defined in DGB/solve.jl — import to extend.
+import DifferentialGamesBase:
+    GameSolver,
+    solve,
+    _solve,
+    WarmstartData,
+    solver_capabilities
 
 # ============================================================================
-# FNELQ — Feedback Nash Equilibrium via LQ Dynamic Programming
+# Solvers
 # ============================================================================
 
 include("solvers/FNELQ/src/fnelq.jl")
+include("solvers/iLQGames/src/ilqgames.jl")
 
 # ============================================================================
-# PANGOLIN — Penalty-Augmented Nash Game via Operating-point Linearization
-#            and Iterative Nash (iLQGames with AL constraints)
+# Visualisation stubs (implementations live in the Plots weak-dep extension)
 #
-# Load order is strict — each file depends on types from the previous ones:
-#   quadraticization  → OperatingPoint, LTVLQApproximation, lq_approximation!
-#   al_augmentation   → ALOptions, ALAugmentedObjective, ALSolverState, dual update
-#   PANGOLIN          → FeedbackStrategy, solve_lq_game!, rollout!, _solve
+# Defining the functions here — as stubs that error with a helpful message —
+# means the names are always exported from this module regardless of whether
+# Plots.jl is loaded. The extension DifferentialGamesBaseSolversPlotsExt
+# overloads these methods when `using Plots` triggers it.
 # ============================================================================
 
-include("solvers/PANGOLIN/src/quadraticization.jl")
-include("solvers/PANGOLIN/src/al_augmentation.jl")
-include("solvers/PANGOLIN/src/PANGOLIN.jl")
+"""
+    animate_solution(sol::GNEPSolution; kwargs...) -> Animation
+
+Animate an iLQGames solution. Requires Plots.jl to be loaded:
+
+```julia
+using Plots
+using DifferentialGamesBaseSolvers
+sol  = solve_figure8(verbose=true)
+anim = animate_solution(sol)
+gif(anim, "figure8.gif"; fps=20)
+```
+
+Dispatches on player count and state dimension:
+- 2-player, 4-state  → figure-8 single unicycle animation
+- 3-player, 12-state → three-vehicle intersection animation
+
+See `save_animation` to write the result to disk.
+"""
+function animate_solution(sol::GNEPSolution; kwargs...)
+    error(
+        "animate_solution requires Plots.jl. Load it first:\n\n" *
+        "    using Plots\n\n" *
+        "then call animate_solution again."
+    )
+end
+
+"""
+    save_animation(anim, path; fps=20)
+
+Save an animation to disk. Requires Plots.jl. Supported formats:
+- `.gif`  — animated GIF (no external dependencies)
+- `.mp4`  — MPEG-4 video (requires ffmpeg on PATH)
+"""
+function save_animation(anim, path::String; fps::Int=20)
+    error(
+        "save_animation requires Plots.jl. Load it first:\n\n" *
+        "    using Plots\n\n" *
+        "then call save_animation again."
+    )
+end
 
 # ============================================================================
 # Exports
 # ============================================================================
 
-# ── FNELQ ────────────────────────────────────────────────────────────────────
 export FNELQ
+export iLQGames
+export animate_solution
+export save_animation
 
-# ── PANGOLIN solver ──────────────────────────────────────────────────────────
-export PANGOLIN
-export PANGOLINCache
-
-# ── Quadraticization layer (Phase 2) ─────────────────────────────────────────
-export OperatingPoint
-export LTVLQApproximation
-export GeneralStageCost
-export GeneralTerminalCost
-export quadraticize
-export linearize
-export lq_approximation!
-
-# ── AL augmentation layer (Phase 3) ──────────────────────────────────────────
-export ALOptions
-export ALAugmentedObjective
-export ALSolverState
-export augmented_stage_cost
-export update_multipliers!
-export update_shared_multipliers!
-export maybe_update_penalty!
-export constraint_violation
-export reset_multipliers!
-export reset_al_state!
-export constraint_dim
-
-# ── PANGOLIN internals (useful for testing and extension) ────────────────────
-export FeedbackStrategy
-export scale_feedforward!
-export solve_lq_game!
-export rollout!
-export backtrack_scale!
-export has_converged
-
-# ── Solver protocol (re-exported for convenience) ────────────────────────────
-export solve, _solve
-
-end
+end # module

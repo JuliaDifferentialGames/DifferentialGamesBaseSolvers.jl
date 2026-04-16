@@ -116,36 +116,51 @@ function build_hallway_problem(;
     # Unicycle Euler dynamics: x = [px, py, θ],  u = [v, ω]
     dyn = (x, u, p, t) -> x .+ dt .* [u[1]*cos(x[3]), u[1]*sin(x[3]), u[2]]
 
-    # ── Stage cost: control effort + running goal-tracking (ALGAMES Eq. 15) ──
-    # Running Q term distributes goal gradient over the entire horizon,
-    # preventing the terminal cost from being overwhelmed by AL penalties.
+    # ── Stage cost: control effort + time-weighted running goal cost ──────────
+    # Uniform running cost opposes collision avoidance at the crossing: the goal
+    # gradient at k≈N/2 pulls agents toward each other's territory. A ramp
+    # α=t/N is near-zero early (agents cross freely) and near-one late
+    # (strong pull to goal after crossing). This breaks the frozen-robot
+    # equilibrium without fighting collision avoidance at the crossing.
     stage_1 = NonlinearStageCost(
         (x, u, p, t) -> begin
-            ctrl_cost = ρ_ctrl * (u[1]^2 + u[2]^2)
-            run_cost  = ρ_run  * sum(abs2, x .- g1)
-            ctrl_cost + run_cost
+            α = T(t) / T(N)
+            ρ_ctrl * (u[1]^2 + u[2]^2) + ρ_run * α * sum(abs2, x .- g1)
         end;
         is_separable = true
     )
     stage_2 = NonlinearStageCost(
         (x, u, p, t) -> begin
-            ctrl_cost = ρ_ctrl * (u[1]^2 + u[2]^2)
-            run_cost  = ρ_run  * sum(abs2, x .- g2)
-            ctrl_cost + run_cost
+            α = T(t) / T(N)
+            ρ_ctrl * (u[1]^2 + u[2]^2) + ρ_run * α * sum(abs2, x .- g2)
         end;
         is_separable = true
     )
 
-    # ── Terminal cost: strong goal-reaching at final state ────────────────────
+    # ── Terminal cost ─────────────────────────────────────────────────────────
     term_1 = NonlinearTerminalCost((x, p) -> ρ_goal * sum(abs2, x .- g1))
     term_2 = NonlinearTerminalCost((x, p) -> ρ_goal * sum(abs2, x .- g2))
 
-    p1 = PlayerSpec(1, 3, 2, x0_1, dyn, PlayerObjective(1, stage_1, term_1))
-    p2 = PlayerSpec(2, 3, 2, x0_2, dyn, PlayerObjective(2, stage_2, term_2))
+    # ── Terminal goal constraint: ‖x_N - g‖² ≤ r_goal² ──────────────────────
+    # Encoded as a stage inequality active only at k=N so it enters through
+    # Q[N] in the backward pass (not Qf), avoiding Riccati blow-up from
+    # large ρ in Qf. Returns -1 (inactive) at all other timesteps.
+    r_goal = T(0.05)
+    goal_c1 = NonlinearConstraint(
+        (x, u, p, t) -> [t == N ? sum(abs2, x .- g1) - r_goal^2 : -one(T)],
+        1; constraint_type = :inequality
+    )
+    goal_c2 = NonlinearConstraint(
+        (x, u, p, t) -> [t == N ? sum(abs2, x .- g2) - r_goal^2 : -one(T)],
+        1; constraint_type = :inequality
+    )
+    priv1 = [PrivateConstraint(goal_c1, 1)]
+    priv2 = [PrivateConstraint(goal_c2, 2)]
+
+    p1 = PlayerSpec(1, 3, 2, x0_1, dyn, PlayerObjective(1, stage_1, term_1), priv1)
+    p2 = PlayerSpec(2, 3, 2, x0_2, dyn, PlayerObjective(2, stage_2, term_2), priv2)
 
     # ── Shared constraints (unnormalized, ALGAMES Eq. 13–14) ─────────────────
-    # Jacobian magnitude ~2*dist (collision) and ~1 (hallway) — interpretable
-    # and makes ρ scaling directly comparable to cost weights.
     coupling_c = NonlinearConstraint(
         (x_joint, u, p, t) -> begin
             p1_xy = x_joint[1:2]
@@ -153,11 +168,11 @@ function build_hallway_problem(;
             py1   = x_joint[2]
             py2   = x_joint[5]
             [
-                d_safe^2 - sum(abs2, p1_xy .- p2_xy),  # collision: ≤ 0 safe
-                 py1 - hw_bound,                         # P1 upper bound
-                -py1 - hw_bound,                         # P1 lower bound
-                 py2 - hw_bound,                         # P2 upper bound
-                -py2 - hw_bound                          # P2 lower bound
+                d_safe^2 - sum(abs2, p1_xy .- p2_xy),
+                 py1 - hw_bound,
+                -py1 - hw_bound,
+                 py2 - hw_bound,
+                -py2 - hw_bound
             ]
         end,
         5; constraint_type = :inequality
@@ -172,43 +187,40 @@ end
 # ============================================================================
 
 game = build_hallway_problem(;
-    N           = 40,
+    N           = 60,
     dt          = 0.1,
     ρ_ctrl      = 0.01,
-    ρ_run       = 2.0,
-    ρ_goal      = 100.0,
-    d_safe      = 0.3,
+    ρ_run       = 5.0,    # ramps from 0 to 5 over horizon — light near crossing, strong near goal
+    ρ_goal      = 1000.0, # very strong terminal pull
+    d_safe      = 0.25,   # smaller safe distance gives geometric slack at crossing
     hw          = 0.5,
-    goal_offset = 0.15
+    goal_offset = 0.35    # separation at crossing = 2*0.35=0.7 > 2*d_safe=0.5 → 0.2m slack
 )
 
 solver = PANGOLIN(;
-    max_iter             = 300,
+    max_iter             = 500,
     convergence_tol      = 1e-3,
-    # iLQGames paper uses ‖ξᵏ - ξᵏ⁻¹‖_∞ < 0.01 as the CONVERGENCE criterion.
-    # The ACCEPTANCE budget must be much looser — it just ensures the new
-    # operating point stays within the region where the LQ approximation is
-    # valid. Agents travel ~2 units over 40 steps (0.05 units/step natural
-    # scale). A budget of 3.0 allows ~60 natural steps of deviation, which
-    # is generous enough to not reject legitimate large updates early in the
-    # solve when ρ is ramping and gains are changing rapidly.
-    max_elwise_diff_step = 3.0,
+    max_elwise_diff_step = 1.0,
     max_line_search_iter = 20,
     α_init               = 0.5,
     α_step               = 0.5,
     armijo_param         = 1e-4,
     state_regularization = 5.0,
     constraint_opts      = ALOptions(;
-        ρ_init        = 1.0,
-        ρ_max         = 20.0,
-        φ             = 1.5,
-        violation_tol = 0.1
+        ρ_init        = 0.1,    # start very small so early iters converge unconstrained
+        ρ_max         = 200.0,
+        φ             = 1.2,    # slow growth: reaches ρ_max in ~50 iters from ρ_init=0.1
+        violation_tol = 1e-3
     )
 )
 
-g1_ws = [1.0,  0.15, 0.0]
-g2_ws = [-1.0, -0.15, 0.0]
-ws = hallway_warmstart(game, [g1_ws, g2_ws], [0.4, -0.4]; dt=0.1)
+g1_ws = [1.0,  0.35, 0.0]
+g2_ws = [-1.0, -0.35, 0.0]
+# Large lateral offset (0.6) pushes crossing geometry wide; the sinusoidal
+# bump peaks at the midpoint (k=N/2=30), but agents are already well-separated
+# at the actual crossing point (k≈10-15) because goal_offset=0.35 gives
+# 0.7m separation. This warmstart keeps agents far apart through the crossing.
+ws = hallway_warmstart(game, [g1_ws, g2_ws], [0.6, -0.6]; dt=0.1)
 
 sol = solve(game, solver; warmstart=ws, verbose=true)
 
@@ -287,7 +299,7 @@ function check_convergence_trigger(sol, solver)
     end
 end
 
-function check_warmstart(ws, game; d_safe=0.3, hw=0.5)
+function check_warmstart(ws, game; d_safe=0.25, hw=0.5)
     println("\n=== Warmstart Check ===")
     N     = game.time_horizon.N
     bound = hw + d_safe / 1.25
@@ -315,7 +327,7 @@ function check_warmstart(ws, game; d_safe=0.3, hw=0.5)
     any_coll || println("  No collisions ✓")
 end
 
-function check_constraints(sol, game; d_safe=0.3, hw=0.5)
+function check_constraints(sol, game; d_safe=0.25, hw=0.5)
     println("\n=== Constraint Violations Along Solution ===")
     N     = game.time_horizon.N
     bound = hw + d_safe / 1.25
@@ -335,6 +347,28 @@ function check_constraints(sol, game; d_safe=0.3, hw=0.5)
             "  mean=", round(mean(h1),   sigdigits=4))
     println("Hallway P2: max=", round(maximum(h2),   sigdigits=4),
             "  mean=", round(mean(h2),   sigdigits=4))
+
+    # Goal inference: agents swap sides including y-offset.
+    # Player 1: x0=[-1,-off,0] → goal=[1,off,0] = [-x0[1], -x0[2], 0]
+    # Player 2: x0=[1,off,0]   → goal=[-1,-off,0]
+    r_goal = 0.05
+    xf1  = sol.trajectories[1].states[:, end]
+    xf2  = sol.trajectories[2].states[:, end]
+    x0_1 = sol.trajectories[1].states[:, 1]
+    x0_2 = sol.trajectories[2].states[:, 1]
+    goal1 = [-x0_1[1], -x0_1[2], 0.0]
+    goal2 = [-x0_2[1], -x0_2[2], 0.0]
+    dist1_sq = sum(abs2, xf1 .- goal1)
+    dist2_sq = sum(abs2, xf2 .- goal2)
+    g1_viol = max(0.0, dist1_sq - r_goal^2)
+    g2_viol = max(0.0, dist2_sq - r_goal^2)
+    println("Goal P1:    ‖xf-g‖=", round(sqrt(dist1_sq), sigdigits=4),
+            "  viol=", round(g1_viol, sigdigits=4),
+            (g1_viol < 1e-6 ? "  ✓" : "  ✗ NOT REACHED"))
+    println("Goal P2:    ‖xf-g‖=", round(sqrt(dist2_sq), sigdigits=4),
+            "  viol=", round(g2_viol, sigdigits=4),
+            (g2_viol < 1e-6 ? "  ✓" : "  ✗ NOT REACHED"))
+
     if maximum(coll) > 1e-4 || maximum(h1) > 1e-4
         println("Per-timestep violations > 1e-4:")
         for k in 1:N+1
