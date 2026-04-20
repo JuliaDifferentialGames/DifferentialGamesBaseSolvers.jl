@@ -71,10 +71,12 @@ Default hyperparameters match the paper's recommended settings (ρ_init=1,
 - `reg`          : Tikhonov regularisation on H (ensures invertibility
                    when Nash equilibrium is non-unique, Section 6.1) (1e-6)
 
-## Backtracking line search (Algorithm 1)
-- `ls_iter`      : Maximum backtracks                             (20)
-- `ls_beta`      : Sufficient-decrease fraction β                 (0.1)
-- `ls_tau`       : Step contraction τ                             (0.5)
+## Regularisation and line search
+- `ls_iter`      : Maximum backtracks in Armijo line search           (20)
+- `ls_beta`      : Sufficient-decrease fraction β                     (0.1)
+- `ls_tau`       : Step contraction τ                                 (0.5)
+- `reg`          : Base regularisation reg_0; actual reg per inner    (1e-3)
+                   step l is reg_0 * l^4 (matches Algames.jl schedule)
 
 ## Convergence tolerances
 - `tol_opt`      : ‖G_stationarity‖₁ / len                      (1e-4)
@@ -90,7 +92,7 @@ Default hyperparameters match the paper's recommended settings (ρ_init=1,
     ρ_increase  ::Float64 = 10.0
     ρ_max       ::Float64 = 1e8
     inner_iter  ::Int     = 10
-    reg         ::Float64 = 1e-6
+    reg         ::Float64 = 1e-3
     ls_iter     ::Int     = 20
     ls_beta     ::Float64 = 0.1
     ls_tau      ::Float64 = 0.5
@@ -108,6 +110,8 @@ function solver_capabilities(::Type{ALGAMES})
         :ConstrainedGame,
         :UnconstrainedGame,
         :DiscreteTime,
+        :SeparableDynamics,
+        :SharedConstraints,
     ]
 end
 
@@ -257,31 +261,48 @@ function _solve(
     dyn_vio   = T(Inf)
     con_vio   = T(Inf)
 
+    # Per-outer-iteration convergence history (for plotting)
+    history_opt = T[]
+    history_dyn = T[]
+    history_con = T[]
+
     for k in 1:solver.outer_iter
         outer_k = k
 
         # ── Newton inner loop ─────────────────────────────────────────────
+        # Matches reference Algames.jl solver_methods.jl:
+        #   reg = reg_0 * l^4 (scheduled, reset each outer iteration)
+        #   Line search with ρ_trial (fixed) — see _line_search
+        #   Break on: (a) stationarity met, (b) Δ_step < Δ_min, (c) LS exhausted
+        _build_residual!(buf, game, ws)
+        Δ_min = T(1e-9)
+
         for l in 1:solver.inner_iter
-            _build_residual!(buf, game, ws)
             G_norm = norm(buf.G, 1)
 
             _build_jacobian!(buf, game, ws)
-            _regularize!(buf.H, solver.reg)
+
+            reg_l = T(solver.reg) * T(l)^4
+            _regularize!(buf.H, ws, Float64(reg_l))
 
             δy = _newton_step(buf.H, buf.G)
             α  = _line_search(game, ws, G_norm, δy, solver)
             _apply_step!(ws, δy, T(α))
 
-            verbose && @printf("  [inner %2d] ‖G‖₁/n=%.3e  α=%.4f\n",
-                               l, G_norm / n_y, α)
+            _build_residual!(buf, game, ws)
+            G_norm_new = norm(buf.G, 1)
+            Δ_step     = α * norm(δy, 1) / n_y
 
-            if G_norm / n_y < solver.tol_opt
-                break
-            end
+            verbose && @printf("  [inner %2d] ‖G‖₁/n=%.3e  α=%.4f  reg=%.1e\n",
+                               l, G_norm_new / n_y, α, reg_l)
+
+            G_norm_new / n_y < solver.tol_opt && break   # (a) converged
+            Δ_step < Δ_min && break                       # (b) step too small
+            α ≤ solver.ls_tau^(solver.ls_iter - 1) && break  # (c) LS exhausted
         end
 
         # ── Convergence check ─────────────────────────────────────────────
-        _build_residual!(buf, game, ws)
+        # buf.G is current — the inner loop ends with _build_residual!
         opt_vio = _stationarity_norm(buf, ws)
         dyn_vio = _dynamics_norm(buf, ws)
         con_vio = _constraint_violation(game, ws)
@@ -290,6 +311,10 @@ function _solve(
             "[outer %3d] opt=%.3e  dyn=%.3e  con=%.3e\n",
             k, opt_vio, dyn_vio, con_vio
         )
+
+        push!(history_opt, opt_vio)
+        push!(history_dyn, dyn_vio)
+        push!(history_con, con_vio)
 
         if opt_vio < solver.tol_opt &&
            dyn_vio < solver.tol_dyn &&
@@ -307,7 +332,8 @@ function _solve(
 
     return _assemble_solution(
         game, ws, converged, outer_k,
-        time() - t_start, opt_vio, dyn_vio, con_vio
+        time() - t_start, opt_vio, dyn_vio, con_vio,
+        history_opt, history_dyn, history_con
     )
 end
 
@@ -398,39 +424,47 @@ end
 # ============================================================================
 
 function _assemble_solution(
-    game      ::GameProblem{T},
-    ws        ::ALGAMESWorkspace{T},
-    converged ::Bool,
-    iters     ::Int,
-    wall_time ::Float64,
-    opt_vio   ::T,
-    dyn_vio   ::T,
-    con_vio   ::T
+    game        ::GameProblem{T},
+    ws          ::ALGAMESWorkspace{T},
+    converged   ::Bool,
+    iters       ::Int,
+    wall_time   ::Float64,
+    opt_vio     ::T,
+    dyn_vio     ::T,
+    con_vio     ::T,
+    history_opt ::Vector{T},
+    history_dyn ::Vector{T},
+    history_con ::Vector{T},
 ) where {T}
     th    = game.time_horizon
     N     = ws.N
     times = collect(range(T(0), th.tf, length = N + 1))
 
+    U_flat = vcat(ws.U...)   # full joint control (m_total × N)
+
     trajectories = map(1:ws.np) do i
         obj = get_objective(game, i)
 
-        # LQStageCost expects x of exactly size(Q,1). For LQGameProblem (shared
-        # state), that is n (full joint state). For PDGNEProblem (SeparableDynamics),
-        # that is nᵢ (private state). Detect via metadata and slice accordingly.
-        if length(game.metadata.state_dims) == ws.np
-            # Separable: player i sees only its private state slice
+        # State list: LQStageCost with separable dynamics needs private slice (no offset fields).
+        # NonlinearStageCost (CompositeCostTerm) uses player_slice internally → full joint state.
+        if obj.stage_cost isa LQStageCost && length(game.metadata.state_dims) == ws.np
             sdim_i = game.metadata.state_dims[i]
             soff_i = game.metadata.state_offsets[i]
             srng_i = soff_i+1 : soff_i+sdim_i
             X_list = [ws.X[srng_i, k] for k in 1:N+1]
         else
-            # Shared state: full joint state
             X_list = [ws.X[:, k] for k in 1:N+1]
         end
 
-        # U_list must use player i's own controls (length mᵢ), not joint controls.
-        U_list = [ws.U[i][:, k] for k in 1:N]
-        c_i    = total_cost(obj, X_list, U_list, nothing)
+        # Control list: LQStageCost needs private control slice (R is mᵢ×mᵢ, no offset).
+        # NonlinearStageCost (QuadraticControlCost) uses player_slice internally → full joint control.
+        if obj.stage_cost isa LQStageCost
+            U_list = [ws.U[i][:, k] for k in 1:N]
+        else
+            U_list = [U_flat[:, k] for k in 1:N]
+        end
+
+        c_i = total_cost(obj, X_list, U_list, nothing)
         Trajectory{T}(i, copy(ws.X), copy(ws.U[i]), times, c_i)
     end
 
@@ -444,6 +478,11 @@ function _assemble_solution(
         :opt_vio => opt_vio,
         :dyn_vio => dyn_vio,
         :con_vio => con_vio,
+        :history => Dict{Symbol, Any}(
+            :opt => copy(history_opt),
+            :dyn => copy(history_dyn),
+            :con => copy(history_con),
+        ),
         :dual_variables => Dict{Symbol, Any}(
             :λ     => copy(ws.λ),
             :ρ     => copy(ws.ρ),

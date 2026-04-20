@@ -1,342 +1,242 @@
+# ============================================================================
+# ext/DifferentialGamesBaseSolversPlotsExt.jl
+#
+# Plots.jl extension for DifferentialGamesBaseSolvers.
+# Activated automatically when both packages are loaded:
+#
+#   using DifferentialGamesBaseSolvers
+#   using Plots
+#
+# Provides:
+#   plot(sol::GNEPSolution; kwargs...)
+#       Two-panel figure: 2D trajectories (left) + convergence residuals (right).
+#
+#   plot_trajectories(sol; kwargs...)
+#       Only the 2D trajectory panel. Useful for composing your own layouts.
+#
+#   plot_convergence(sol; kwargs...)
+#       Only the convergence residuals panel.
+#
+# Both single-panel functions return a Plots.Plot and accept any Plots keyword
+# argument, passed through to the underlying plot call.
+#
+# ── State layout assumption ──────────────────────────────────────────────────
+# The 2D trajectory plot reads x-position and y-position from the joint state
+# trajectory stored in sol.state_trajectory (n × N+1 matrix).
+#
+# For SeparableDynamics games (PDGNEProblem), each player's private state is
+# a contiguous block: player i occupies rows [(i-1)*nᵢ+1 : i*nᵢ] and the
+# first two components of that block are (x, y).
+#
+# For shared-state games (LQGameProblem), the x/y indices must be supplied
+# explicitly via the `xy_indices` keyword argument.
+#
+# The plot uses game.metadata to detect the layout automatically when possible.
+# ============================================================================
+
 module DifferentialGamesBaseSolversPlotsExt
 
 using DifferentialGamesBaseSolvers
 using DifferentialGamesBase
 using Plots
-using Printf
+
+# Palette: one colour per player, cycling if needed
+const _PLAYER_COLOURS = [:royalblue, :crimson, :forestgreen,
+                          :darkorange, :purple, :teal]
+
+_player_colour(i::Int) = _PLAYER_COLOURS[mod1(i, length(_PLAYER_COLOURS))]
 
 # ============================================================================
-# animate_solution — dispatch on player count / state structure
+# Public API — overload Plots.plot
 # ============================================================================
 
 """
-    animate_solution(sol::GNEPSolution; kwargs...) -> Animation
+    plot(sol::GNEPSolution; layout=:both, xy_indices=nothing, kwargs...)
 
-Animate a `GNEPSolution` produced by iLQGames. Dispatches automatically:
-- 2-player, 4-state game  → `animate_figure8`   (shared unicycle, iLQGames.jl style)
-- 3-player, 12-state game → `animate_intersection` (3-vehicle intersection)
+Plot an ALGAMES solution. Returns a `Plots.Plot`.
 
-All keyword arguments are forwarded to the specific animation function.
+## Keyword arguments
+- `layout`      : `:both` (default) — two-panel [trajectories | convergence];
+                  `:trajectories` — trajectory panel only;
+                  `:convergence`  — convergence panel only.
+- `xy_indices`  : For shared-state games, a `Vector{Tuple{Int,Int}}` giving
+                  the `(x_idx, y_idx)` joint-state indices for each player.
+                  For PDGNEPs, detected automatically from metadata.
+- Any remaining kwargs are forwarded to `Plots.plot`.
 """
-function DifferentialGamesBaseSolvers.animate_solution(
-    sol::GNEPSolution;
-    fps::Int             = 20,
-    subsample::Int       = 1,
-    trail_len::Int       = -1,   # -1 → full horizon for figure-8, 25 for intersection
-    arrow_scale::Float64 = 0.3,
-    figsize::Tuple       = (500, 500),
-    kwargs...
-)
-    np = sol.game.n_players
-    n  = size(sol.state_trajectory, 1)
-    N  = size(sol.state_trajectory, 2) - 1
-
-    if np == 2 && n == 4
-        tl = trail_len < 0 ? N : trail_len
-        return animate_figure8(sol; fps, subsample, trail_len=tl, figsize, kwargs...)
-    elseif np == 3 && n == 12
-        tl = trail_len < 0 ? 25 : trail_len
-        return animate_intersection(sol; fps, subsample, trail_len=tl,
-                                    arrow_scale, figsize, kwargs...)
+function Plots.plot(sol::GNEPSolution; layout=:both, xy_indices=nothing, kwargs...)
+    if layout == :trajectories
+        return plot_trajectories(sol; xy_indices, kwargs...)
+    elseif layout == :convergence
+        return plot_convergence(sol; kwargs...)
     else
-        error("animate_solution: no animation defined for np=$np, n=$n. " *
-              "Call animate_figure8 or animate_intersection directly.")
+        p1 = plot_trajectories(sol; xy_indices)
+        p2 = plot_convergence(sol)
+        return plot(p1, p2; layout=(1,2), size=(900,400), kwargs...)
     end
 end
 
 # ============================================================================
-# Shared helpers
-# ============================================================================
-
-# Draw a heading arrow at (px, py) pointing in direction φ.
-# Returns nothing (mutates the current plot via plot!).
-function _draw_arrow!(px, py, φ, scale, color; lw=2)
-    dx = scale * cos(φ)
-    dy = scale * sin(φ)
-    plot!([px, px + dx], [py, py + dy];
-          arrow=true, color=color, lw=lw, label=false)
-end
-
-# Draw a filled circle (vehicle body) at (px, py).
-function _draw_vehicle!(px, py, r, color)
-    θs = range(0, 2π, length=20)
-    xs = px .+ r .* cos.(θs)
-    ys = py .+ r .* sin.(θs)
-    plot!(xs, ys; seriestype=:shape, fillcolor=color, linecolor=color,
-          alpha=0.7, label=false)
-end
-
-# Return the slice of indices into the trail that fall within [1, N+1].
-function _trail_range(k, trail_len, N)
-    lo = max(1, k - trail_len)
-    return lo:k
-end
-
-# ============================================================================
-# Figure-8 animation
+# plot_trajectories
 # ============================================================================
 
 """
-    animate_figure8(sol; kwargs...) -> Animation
+    plot_trajectories(sol::GNEPSolution; xy_indices=nothing, kwargs...) -> Plot
 
-Animate the two-player shared unicycle figure-8 game, matching the layout
-of the `plot_traj` visualisation from iLQGames.jl:
+2D trajectory plot. Each player's path is drawn as a coloured line with
+scatter markers at the initial position (○) and final position (★).
 
-  Left column  : u₁ (steering, red) and u₂ (acceleration, green) vs time step
-  Right panel  : x-y trajectory with a growing trail and current-position dot
+For PDGNEPs (SeparableDynamics), x/y indices are auto-detected from
+`game.metadata`: player i occupies `state_offsets[i]+1 : state_offsets[i]+state_dims[i]`
+and positions are the first two components of that slice.
 
-# Keyword arguments
-- `fps::Int = 20`           : frames per second
-- `subsample::Int = 2`      : animate every nth step
-- `trail_len::Int = 200`    : timesteps of history shown on the xy panel
-- `figsize::Tuple = (700,400)` : figure pixel dimensions
+For shared-state games, supply `xy_indices::Vector{Tuple{Int,Int}}` where
+entry `i` gives `(x_joint_idx, y_joint_idx)` for player i.
 """
-function animate_figure8(
-    sol::GNEPSolution;
-    fps::Int             = 20,
-    subsample::Int       = 2,
-    trail_len::Int       = 200,
-    figsize::Tuple       = (700, 400),
-    kwargs...
-)
-    X   = sol.state_trajectory          # (4 × N+1)
-    U1  = sol.trajectories[1].controls  # (1 × N) steering ω
-    U2  = sol.trajectories[2].controls  # (1 × N) acceleration a
-    N   = size(X, 2) - 1
-    dt  = sol.game.time_horizon.dt
-    ts  = 0:N-1   # time step indices for controls
+function plot_trajectories(sol::GNEPSolution;
+                            xy_indices = nothing,
+                            kwargs...)
+    game = sol.game
+    np   = game.n_players
+    X    = sol.state_trajectory   # (n × N+1)
 
-    px_all = X[1, :]; py_all = X[2, :]
-    u1_all = vec(U1);  u2_all = vec(U2)
+    # Resolve position indices in joint state
+    xi, yi = _resolve_xy_indices(game, np, xy_indices)
 
-    # Fixed axis limits across frames
-    u1_lim = (minimum(u1_all) - 0.2, maximum(u1_all) + 0.2)
-    u2_lim = (min(0.0, minimum(u2_all)) - 0.05, maximum(u2_all) + 0.05)
-    pad    = 0.5
-    xy_lim = (minimum(px_all) - pad, maximum(px_all) + pad)
-    yy_lim = (minimum(py_all) - pad, maximum(py_all) + pad)
+    p = plot(;
+        aspect_ratio = :equal,
+        xlabel       = "x",
+        ylabel       = "y",
+        title        = "Trajectories",
+        legend       = :outertopright,
+        kwargs...
+    )
 
-    frames = 1:subsample:(N+1)
+    for i in 1:np
+        col  = _player_colour(i)
+        xs   = X[xi[i], :]
+        ys   = X[yi[i], :]
 
-    anim = @animate for k in frames
-        lo = max(1, k - trail_len)
-        tr = lo:k
-
-        l = @layout [grid(2,1){0.38w}  a{0.62w}]
-        plot(; layout=l, size=figsize, background_color=:white,
-               left_margin=4Plots.mm, bottom_margin=4Plots.mm)
-
-        # ── Top-left: u₁ (steering) ──────────────────────────────────────────
-        # Show full control history in grey, highlight up to current step in red
-        plot!(ts, u1_all;
-              subplot=1, color=:lightgrey, lw=1, label=false,
-              xlims=(0, N), ylims=u1_lim, grid=true,
-              ylabel="u₁", xlabel="time step", title="")
-        if k > 1
-            plot!(ts[1:min(k-1,N)], u1_all[1:min(k-1,N)];
-                  subplot=1, color=:red, lw=1.5, label=false)
-        end
-        vline!([k-1]; subplot=1, color=:black, lw=0.8, ls=:dash, label=false)
-
-        # ── Bottom-left: u₂ (acceleration) ───────────────────────────────────
-        plot!(ts, u2_all;
-              subplot=2, color=:lightgrey, lw=1, label=false,
-              xlims=(0, N), ylims=u2_lim, grid=true,
-              ylabel="u₂", xlabel="time step", title="")
-        if k > 1
-            plot!(ts[1:min(k-1,N)], u2_all[1:min(k-1,N)];
-                  subplot=2, color=:green, lw=1.5, label=false)
-        end
-        vline!([k-1]; subplot=2, color=:black, lw=0.8, ls=:dash, label=false)
-
-        # ── Right: x-y trajectory ─────────────────────────────────────────────
-        plot!(; subplot=3,
-              xlims=xy_lim, ylims=yy_lim,
-              aspect_ratio=:equal, grid=true,
-              xlabel="pₓ [m]", ylabel="pᵧ [m]",
-              title="", legend=false)
-
-        # Full planned path (faint black, always visible for context)
-        plot!(X[1, :], X[2, :];
-              subplot=3, color=:black, lw=0.6, alpha=0.18, label=false)
-
-        # Growing trail
-        if length(tr) > 1
-            plot!(X[1, tr], X[2, tr];
-                  subplot=3, color=:black, lw=1.4, alpha=0.7, label=false)
-        end
-
-        # Current position — filled diamond (matching reference)
-        scatter!([X[1, k]], [X[2, k]];
-                 subplot=3, marker=:diamond, ms=7,
-                 color=:black, markerstrokewidth=0, label=false)
+        # Path
+        plot!(p, xs, ys;
+            color     = col,
+            linewidth = 2,
+            label     = "Player $i"
+        )
+        # Start marker
+        scatter!(p, [xs[1]], [ys[1]];
+            color       = col,
+            markershape = :circle,
+            markersize  = 6,
+            label       = false
+        )
+        # End marker
+        scatter!(p, [xs[end]], [ys[end]];
+            color       = col,
+            markershape = :star5,
+            markersize  = 8,
+            label       = false
+        )
     end
 
-    return anim
+    return p
 end
 
 # ============================================================================
-# Three-player intersection animation
+# plot_convergence
 # ============================================================================
 
 """
-    animate_intersection(sol; kwargs...) -> Animation
+    plot_convergence(sol::GNEPSolution; kwargs...) -> Plot
 
-Animate the three-player unicycle intersection game.
+Semi-log plot of the per-outer-iteration convergence residuals stored in
+`sol.solver_info[:history]`. Shows stationarity (opt), dynamics (dyn), and
+constraint violation (con) as a function of outer AL iteration.
 
-State layout:
-  x[1:4]  = (px₁, py₁, φ₁, v₁)  — Player 1 (south → north), red
-  x[5:8]  = (px₂, py₂, φ₂, v₂)  — Player 2 (west  → east),  blue
-  x[9:12] = (px₃, py₃, φ₃, v₃)  — Player 3 (north → south), green
-
-The animation shows:
-- Each vehicle as a filled circle with a heading arrow
-- Trail of past positions per vehicle
-- Goal position markers (★)
-- Road layout (grey lane markings)
-- Proximity radius circles when vehicles are close
+Returns a plain `Plots.Plot` if convergence history is available, or a text
+annotation plot if it is not (e.g. solution was loaded from a file without
+history).
 """
-function animate_intersection(
-    sol::GNEPSolution;
-    fps::Int             = 20,
-    subsample::Int       = 2,
-    trail_len::Int       = 25,
-    arrow_scale::Float64 = 0.3,
-    figsize::Tuple       = (650, 650),
-    vehicle_r::Float64   = 0.15,
-    road_hw::Float64     = 0.8,      # half-width of road markings
-    prox_r::Float64      = 1.5,      # proximity warning radius
-    goals::Vector        = [[0.0, 4.0], [4.0, 0.0], [0.0, -4.0]],
-    kwargs...
-)
-    X   = sol.state_trajectory       # (12 × N+1)
-    N   = size(X, 2) - 1
-    dt  = sol.game.time_horizon.dt
-
-    # Per-player state accessors
-    px(i, k) = X[4*(i-1)+1, k]
-    py(i, k) = X[4*(i-1)+2, k]
-    φ(i, k)  = X[4*(i-1)+3, k]
-    v(i, k)  = X[4*(i-1)+4, k]
-
-    colors = [:crimson, :royalblue, :forestgreen]
-    names  = ["P1 (S→N)", "P2 (W→E)", "P3 (N→S)"]
-
-    # Fixed axis limits around the intersection
-    ax_lim = 5.5
-    xlims  = (-ax_lim, ax_lim)
-    ylims  = (-ax_lim, ax_lim)
-
-    frames = 1:subsample:(N+1)
-
-    anim = @animate for k in frames
-        t_now = (k-1) * dt
-
-        plot(; size=figsize, xlims=xlims, ylims=ylims,
-               aspect_ratio=:equal, grid=false, legend=:topright,
-               title=@sprintf("3-Player Intersection  t=%.1fs", t_now),
-               xlabel="x (m)", ylabel="y (m)",
-               background_color=:white)
-
-        # ── Road markings ────────────────────────────────────────────────────
-        # Vertical road (Players 1 & 3)
-        plot!([-road_hw, -road_hw], [-ax_lim, ax_lim];
-              color=:lightgrey, lw=1, label=false)
-        plot!([ road_hw,  road_hw], [-ax_lim, ax_lim];
-              color=:lightgrey, lw=1, label=false)
-        # Horizontal road (Player 2)
-        plot!([-ax_lim, ax_lim], [-road_hw, -road_hw];
-              color=:lightgrey, lw=1, label=false)
-        plot!([-ax_lim, ax_lim], [ road_hw,  road_hw];
-              color=:lightgrey, lw=1, label=false)
-        # Centre dashed lines
-        plot!([0.0, 0.0], [-ax_lim, ax_lim];
-              color=:grey, lw=0.8, ls=:dash, label=false)
-        plot!([-ax_lim, ax_lim], [0.0, 0.0];
-              color=:grey, lw=0.8, ls=:dash, label=false)
-
-        # ── Goal markers ─────────────────────────────────────────────────────
-        for i in 1:3
-            scatter!([goals[i][1]], [goals[i][2]];
-                     marker=:star5, ms=12, color=colors[i],
-                     markerstrokewidth=0, alpha=0.5, label=false)
-        end
-
-        # ── Proximity warning circles (when vehicles are close) ───────────
-        for i in 1:3, j in (i+1):3
-            d = norm([px(i,k) - px(j,k), py(i,k) - py(j,k)])
-            if d < prox_r
-                # Draw a faint warning circle centred between the two vehicles
-                mx = (px(i,k) + px(j,k)) / 2
-                my = (py(i,k) + py(j,k)) / 2
-                θs = range(0, 2π, length=40)
-                r  = d / 2
-                plot!(mx .+ r .* cos.(θs), my .+ r .* sin.(θs);
-                      color=:orange, lw=1, alpha=0.4, label=false)
-            end
-        end
-
-        # ── Per-vehicle trail, body, arrow ────────────────────────────────
-        for i in 1:3
-            c  = colors[i]
-            tr = _trail_range(k, trail_len, N)
-
-            # Trail
-            if length(tr) > 1
-                plot!([px(i, kk) for kk in tr],
-                      [py(i, kk) for kk in tr];
-                      color=c, lw=1.5, alpha=0.45, label=false)
-            end
-
-            # Vehicle body
-            _draw_vehicle!(px(i, k), py(i, k), vehicle_r, c)
-
-            # Heading arrow
-            _draw_arrow!(px(i, k), py(i, k), φ(i, k), arrow_scale, c; lw=2)
-
-            # Legend entry (only at first plotted position for cleanliness)
-            scatter!([px(i, k)], [py(i, k)];
-                     color=c, ms=0, label=@sprintf("%s  v=%.1f", names[i], v(i, k)))
-        end
+function plot_convergence(sol::GNEPSolution; kwargs...)
+    info = sol.solver_info
+    if !haskey(info, :history)
+        return plot(; title="Convergence (no history stored)",
+                      annotations=(0.5, 0.5, "Run solve() to generate history"),
+                      kwargs...)
     end
 
-    return anim
-end
+    hist = info[:history]
+    opt  = Float64.(hist[:opt])
+    dyn  = Float64.(hist[:dyn])
+    con  = Float64.(hist[:con])
+    iters = 1:length(opt)
 
-# ============================================================================
-# save_animation — convenience wrapper
-# ============================================================================
+    p = plot(;
+        yscale  = :log10,
+        xlabel  = "Outer iteration",
+        ylabel  = "Residual (log₁₀ scale)",
+        title   = "Convergence",
+        legend  = :topright,
+        kwargs...
+    )
 
-"""
-    save_animation(anim::Animation, path::String; fps=20)
+    plot!(p, iters, max.(opt, 1e-16); label="‖G_stat‖",  color=:royalblue,  linewidth=2)
+    plot!(p, iters, max.(dyn, 1e-16); label="‖dyn‖",     color=:crimson,    linewidth=2)
+    plot!(p, iters, max.(con, 1e-16); label="max(C)",     color=:forestgreen, linewidth=2)
 
-Save an `Animation` to `path`. Extension determines format:
-- `.gif`  : animated GIF (default, broadly compatible)
-- `.mp4`  : MPEG-4 video (requires ffmpeg on PATH)
-
-# Example
-```julia
-using Plots
-using DifferentialGamesBaseSolvers
-sol  = solve_figure8()
-anim = animate_solution(sol)
-save_animation(anim, "figure8.gif")
-```
-"""
-function DifferentialGamesBaseSolvers.save_animation(
-    anim::Plots.Animation,
-    path::String;
-    fps::Int = 20
-)
-    if endswith(path, ".gif")
-        gif(anim, path; fps=fps)
-    elseif endswith(path, ".mp4")
-        mp4(anim, path; fps=fps)
-    else
-        error("save_animation: unsupported extension in '$path'. Use .gif or .mp4.")
+    # Mark convergence with a vertical dashed line if solver converged
+    if sol.converged && sol.iterations < length(opt)
+        vline!(p, [sol.iterations];
+            linestyle = :dash,
+            color     = :gray,
+            label     = "converged"
+        )
     end
-    @info "Animation saved" path=path fps=fps frames=length(anim.frames)
-    return path
+
+    return p
 end
 
-end # module DifferentialGamesBaseSolversPlotsExt
+# ============================================================================
+# Internals
+# ============================================================================
+
+"""
+    _resolve_xy_indices(game, np, xy_indices) -> (xi, yi)
+
+Returns two length-np vectors of joint-state indices for x and y positions.
+
+- If `xy_indices` is provided as `Vector{Tuple{Int,Int}}`, use it directly.
+- If the game uses `SeparableDynamics` (PDGNEProblem), detect from metadata:
+  player i occupies `state_offsets[i]+1 : state_offsets[i]+state_dims[i]`
+  and positions are the first two components (index 1 and 2 of private state).
+- Otherwise fall back to `(1, 2)` for all players with a warning.
+"""
+function _resolve_xy_indices(game, np, xy_indices)
+    if xy_indices !== nothing
+        @assert length(xy_indices) == np "xy_indices must have one entry per player"
+        xi = [xy_indices[i][1] for i in 1:np]
+        yi = [xy_indices[i][2] for i in 1:np]
+        return xi, yi
+    end
+
+    meta = game.metadata
+    if length(meta.state_dims) == np
+        # PDGNEProblem: contiguous private-state blocks, positions at +1 and +2
+        xi = [meta.state_offsets[i] + 1 for i in 1:np]
+        yi = [meta.state_offsets[i] + 2 for i in 1:np]
+        return xi, yi
+    end
+
+    # Shared-state fallback: assume positions at 1 and 2 for all players.
+    # The user should pass xy_indices for anything more specific.
+    if np > 1
+        @warn "plot_trajectories: shared-state game with np=$np players. " *
+              "Assuming x=x[1], y=x[2] for all players. " *
+              "Pass xy_indices=[(xi1,yi1), ...] to override."
+    end
+    xi = fill(1, np)
+    yi = fill(2, np)
+    return xi, yi
+end
+
+end # module

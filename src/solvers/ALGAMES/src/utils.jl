@@ -389,42 +389,56 @@ function _G_into!(G ::AbstractVector{S},
             u_rng_i  = coff[i]+1 : coff[i]+mi
             obj_i    = get_objective(game, i)
 
-            # State slice for player i's cost evaluation.
+            # Cost gradients w.r.t. full joint (x_k, u_k).
             #
-            # LQGameProblem (shared-state, LinearDynamics):
-            #   metadata.state_dims = [n], state_offsets = [0]
-            #   → every player's cost was built against the full joint state
-            #   → s_rng_i = 1:n, x_state_i = x_k
+            # Two cost conventions coexist in DGB:
             #
-            # PDGNEProblem (SeparableDynamics, DifferentialGame):
-            #   metadata.state_dims = [n₁, n₂, ...], state_offsets = [0, n₁, ...]
-            #   → player i's cost was built against nᵢ-dimensional private state
-            #   → s_rng_i = soff_i+1 : soff_i+nᵢ
+            # 1. NonlinearStageCost (from minimize(CompositeCostTerm...)):
+            #    gradient = (x,u,p,t) -> cost_term_gradient(stage, x, u, p, t)
+            #    cost_term_gradient concatenates z=[x;u] and differentiates through
+            #    evaluate_cost_term, which calls player_slice(x, offset, dim) and
+            #    player_slice(u, offset, dim) internally.
+            #    → Must receive full joint (x_k, u_k); returns (∇x of length n, ∇u of length m_total).
             #
-            # We detect which case we are in by checking whether state_dims has
-            # one entry (shared) or np entries (separable).
-            if length(game.metadata.state_dims) == np
-                # Separable: per-player private state
-                sdim_i  = game.metadata.state_dims[i]
-                soff_i  = game.metadata.state_offsets[i]
+            # 2. LQStageCost (from LQGameProblem / direct construction):
+            #    stage_cost_gradient does Q*x + M*u + q with no slicing.
+            #    Q is sized (n×n) for shared-state games, (nᵢ×nᵢ) for separable games.
+            #    → For shared-state games: pass full (x_k, u_k[u_rng_i]).
+            #    → For separable games: pass private slice (x_k[s_rng_i], u_k[u_rng_i]).
+            #
+            # We dispatch on stage cost type to handle both cases correctly.
+            gx_ik, gu_ik_full = if obj_i.stage_cost isa LQStageCost
+                # LQStageCost: no offset fields; must receive correctly-sized inputs.
+                if length(game.metadata.state_dims) == np
+                    # Separable: pass private state slice and private control
+                    sdim_i = game.metadata.state_dims[i]
+                    soff_i = game.metadata.state_offsets[i]
+                    s_rng_i = soff_i+1 : soff_i+sdim_i
+                    gx_local, gu_local = stage_cost_gradient(
+                        obj_i.stage_cost, x_k[s_rng_i], u_k[u_rng_i], nothing, k
+                    )
+                    # Embed private gradient back into full-n vector
+                    gx_full = zeros(S, n)
+                    gx_full[s_rng_i] .= gx_local
+                    gu_full = zeros(S, sum(cdim))
+                    gu_full[u_rng_i] .= gu_local
+                    gx_full, gu_full
+                else
+                    # Shared state: Q is (n×n), pass full x and private u
+                    gx_full, gu_local = stage_cost_gradient(
+                        obj_i.stage_cost, x_k, u_k[u_rng_i], nothing, k
+                    )
+                    gu_full = zeros(S, sum(cdim))
+                    gu_full[u_rng_i] .= gu_local
+                    gx_full, gu_full
+                end
             else
-                # Shared: all players see the full joint state
-                sdim_i = n
-                soff_i = 0
+                # NonlinearStageCost / CompositeCostTerm: pass full joint (x, u).
+                # Returns (∇x of length n, ∇u of length m_total).
+                stage_cost_gradient(obj_i.stage_cost, x_k, u_k, nothing, k)
             end
-            s_rng_i    = soff_i+1 : soff_i+sdim_i
-            x_state_i  = x_k[s_rng_i]    # (nᵢ,) slice for cost evaluation
-            x1_state_i = x_k1[s_rng_i]   # (nᵢ,) slice for terminal cost
-
-            # Compute both cost gradients against the correct state slice.
-            # gx_ik_local is (nᵢ,): ∂J^i/∂xᵢ(k).
-            # We embed it back into a full-n vector (zeros elsewhere) so it can
-            # be added to the length-n G rows which represent the full joint state.
-            gx_ik_local, gu_ik = stage_cost_gradient(
-                obj_i.stage_cost, x_state_i, u_k[u_rng_i], nothing, k
-            )
-            gx_ik          = zeros(S, n)
-            gx_ik[s_rng_i] .= gx_ik_local
+            # Player i's control gradient is the u_rng_i slice of gu_ik_full
+            gu_ik = gu_ik_full[u_rng_i]
 
             # ── G^i_{u^i(k)} row ────────────────────────────────────────────
             # = ∂J^i/∂u^i(k) + Bᵢₖᵀ λᵢₖ + Jcuᵢᵀ pen_k
@@ -447,11 +461,26 @@ function _G_into!(G ::AbstractVector{S},
             @views G[_Gx_idx(ws, i, k)] .+= -λᵢₖ
 
             # ── Terminal cost gradient at x(N+1) (k=N only) ─────────────────
-            # ∂Φ^i/∂x(N+1): added to the x(N+1) row = _Gx_idx(ws,i,N)
             if k == N
-                gx_term_local = terminal_cost_gradient(obj_i.terminal_cost, x1_state_i, nothing)
-                gx_term        = zeros(S, n)
-                gx_term[s_rng_i] .= gx_term_local
+                gx_term = if obj_i.terminal_cost isa LQTerminalCost
+                    if length(game.metadata.state_dims) == np
+                        # Separable LQTerminalCost: Qf is (nᵢ×nᵢ), needs private slice
+                        sdim_i = game.metadata.state_dims[i]
+                        soff_i = game.metadata.state_offsets[i]
+                        s_rng_i = soff_i+1 : soff_i+sdim_i
+                        gx_local = terminal_cost_gradient(obj_i.terminal_cost, x_k1[s_rng_i], nothing)
+                        gx_full  = zeros(S, n)
+                        gx_full[s_rng_i] .= gx_local
+                        gx_full
+                    else
+                        # Shared LQTerminalCost: Qf is (n×n), pass full x
+                        terminal_cost_gradient(obj_i.terminal_cost, x_k1, nothing)
+                    end
+                else
+                    # NonlinearTerminalCost / CompositeTerminalCostTerm:
+                    # cost_term_gradient uses player_slice internally → full x
+                    terminal_cost_gradient(obj_i.terminal_cost, x_k1, nothing)
+                end
                 @views G[_Gx_idx(ws, i, N)] .+= gx_term
             end
         end
@@ -512,15 +541,21 @@ function _newton_step(H::Matrix{T}, G::Vector{T}) where {T}
 end
 
 """
-    _regularize!(H, reg)
+    _regularize!(H, ws, reg)
 
-Add reg·I to H in-place.  Handles non-unique Nash equilibria (Section 6.1):
-when the Nash solution is non-isolated (e.g. LQ games), H is singular.
-The Tikhonov shift selects the minimum-perturbation Newton step.
+Add reg·I to the PRIMAL rows of H only (state x and control u blocks).
+The dynamics-multiplier rows (Λ_dyn) are NOT regularised.
+
+This matches the reference Algames.jl regularize_residual_jacobian! which
+adds reg only to the (x,x) and (u,u) diagonal blocks — not to the (λ,λ)
+block. Regularising the dynamics-multiplier rows corrupts the dynamics
+residual, which is already linear in the multipliers.
 """
-function _regularize!(H::Matrix{T}, reg::Float64) where {T}
+function _regularize!(H::Matrix{T}, ws::ALGAMESWorkspace, reg::Float64) where {T}
     r = T(reg)
-    @inbounds for i in axes(H, 1)
+    # Primal rows: first n*N (state) + sum(cdim)*N (control) entries of y
+    n_primal = (ws.n + sum(ws.control_dims)) * ws.N
+    @inbounds for i in 1:n_primal
         H[i, i] += r
     end
 end
@@ -533,9 +568,13 @@ end
     _line_search(game, ws, G_norm_1, δy, solver) -> α
 
 Armijo backtracking: find α ∈ (0,1] such that
-  ‖G(y + α·δy)‖₁ ≤ (1 − α·β) · ‖G(y)‖₁
+  ‖G_trial(y + α·δy)‖₁ ≤ (1 − α·β) · ‖G(y)‖₁
 
-Contracts α by τ each step.  Returns last α if sufficient decrease never met.
+Trial residuals are evaluated with ρ clamped to ρ_init (the fixed
+`ρ_trial = 1.0` of the reference). This keeps the line search
+well-conditioned as the AL penalty grows in the outer loop — matching
+the reference Algames.jl line_search which uses prob.pen.ρ_trial (fixed)
+rather than the current prob.pen.ρ (growing).
 """
 function _line_search(
     game    ::GameProblem{T},
@@ -544,18 +583,43 @@ function _line_search(
     δy      ::Vector{T},
     solver  ::ALGAMES
 ) where {T}
-    β = T(solver.ls_beta)
-    τ = T(solver.ls_tau)
-    α = one(T)
+    β  = T(solver.ls_beta)
+    τ  = T(solver.ls_tau)
+    α  = one(T)
+
+    # Build a copy of ws with ρ clamped to ρ_init for trial evaluations.
+    # This matches the reference ρ_trial = 1.0 — the line search merit
+    # function uses a fixed small penalty so α doesn't collapse as ρ grows.
+    ρ_trial = fill(T(solver.ρ_init), length(ws.ρ))
+
     for _ in 1:solver.ls_iter
         y_trial = _pack_y(ws) .+ α .* δy
-        G_trial = _G_from_y(game, ws, y_trial)
+        G_trial = _G_from_y_with_rho(game, ws, y_trial, ρ_trial)
         if norm(G_trial, 1) ≤ (1 - α * β) * G_norm_1
             return α
         end
         α *= τ
     end
     return α
+end
+
+"""
+    _G_from_y_with_rho(game, ws_ref, y, ρ_override) -> Vector{S}
+
+Like _G_from_y but uses ρ_override instead of ws_ref.ρ.
+Used by line search to evaluate trial residuals at fixed ρ_trial.
+"""
+function _G_from_y_with_rho(
+    game     ::GameProblem{T},
+    ws_ref   ::ALGAMESWorkspace{T},
+    y        ::AbstractVector{T},
+    ρ_trial  ::Vector{T}
+) where {T}
+    ws_tmp      = _unpack_y(ws_ref, y)
+    ws_tmp.ρ   .= ρ_trial
+    G_tmp       = zeros(T, _G_dim(ws_ref))
+    _G_into!(G_tmp, game, ws_tmp)
+    return G_tmp
 end
 
 # ============================================================================
