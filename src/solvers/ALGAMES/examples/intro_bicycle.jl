@@ -399,4 +399,7 @@ function _bicycle_zero_speed_warmstart(game::GameProblem{T}, a_seed::T) where {T
 end
 
 sol = solve_bicycle_intro(verbose=true)
-plot_trajectories(sol)
+using Plots
+plot(sol)
+
+

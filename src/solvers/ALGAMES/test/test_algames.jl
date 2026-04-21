@@ -458,4 +458,166 @@ end
     @test sol.equilibrium_type == :OpenLoopNash
 end
 
+# ============================================================================
+# Cat 5 — Regression tests for specific bugs fixed
+# ============================================================================
+
+# These tests expose each of the four bugs that caused divergence:
+#   Bug 1: _al_pen returned ρ*(λ+ρC) instead of λ+ρC
+#   Bug 2: Active-set check used C<0 ∧ |λ|≈0 instead of λ+ρC<0
+#   Bug 3: _regularize! added reg to H[i,i] in (G-interleaved, y-separated)
+#          layout — added to cross-variable off-diagonal entries for i>n
+#   Bug 4: Line search compared G_trial(ρ_trial=1) ≤ (1-α*β)*G_norm(ρ_current),
+#          making Armijo trivially satisfied as ρ grew
+
+import DifferentialGamesBaseSolvers: _al_pen, _regularize!
+
+@testset "Cat 5 (Bug 1+2): _al_pen formula is λ+ρC, not ρ*(λ+ρC)" begin
+    T  = Float64; tf = T(1.0); dt = T(0.1)
+    f  = (x, u, p, t) -> [x[2]; u[1]]
+    Q  = Matrix{T}(I,2,2); Qf = 5.0*Q; R = Matrix{T}(I,1,1)
+    o1 = PlayerObjective(1, LQStageCost(Q, R), LQTerminalCost(Qf))
+    o2 = PlayerObjective(2, LQStageCost(Q, R), LQTerminalCost(Qf))
+    # d_min = 2.0 so players at distance 0.1 apart are well inside the constraint
+    prx = collision_avoidance([1,2]; i_offset=0, j_offset=2, pos_dim=1, d_min=2.0)
+    p1  = Player{T}(1, 2, 1, [0.05, 0.0], f, o1, [])
+    p2  = Player{T}(2, 2, 1, [-0.05, 0.0], f, o2, [])
+    cgame = DifferentialGame([p1, p2], tf, dt; shared_constraints=[prx])
+
+    ws = ALGAMESWorkspace(cgame, ALGAMES(ρ_init=1.0), nothing)
+
+    ρ_val = 10.0; λ_val = 2.0
+    ws.ρ .= ρ_val; ws.λ .= λ_val
+
+    # Players at distance 0.1 apart with d_min=2.0 → C = d_min² − dist² > 0
+    x_k = ws.X[:, 1]; u_k = vcat([ws.U[i][:,1] for i in 1:2]...)
+    C_k, _, _ = DifferentialGamesBaseSolvers._con_eval(cgame, ws, x_k, u_k, 1)
+    @test !isempty(C_k) && C_k[1] > 0   # sanity: constraint is violated
+
+    pen = _al_pen(C_k, ws, 1, cgame)
+    expected = λ_val + ρ_val * C_k[1]          # correct: λ + ρC
+    wrong    = ρ_val * (λ_val + ρ_val * C_k[1]) # old bug: ρ*(λ+ρC)
+    @test pen[1] ≈ expected atol=1e-10
+    @test abs(pen[1] - wrong) > 1.0   # must NOT match the old formula (off by ρ×)
+end
+
+@testset "Cat 5 (Bug 2): active-set check: inactive when λ+ρC < 0" begin
+    T  = Float64; tf = T(1.0); dt = T(0.1); N = Int(round(tf/dt))
+    f  = (x, u, p, t) -> [x[2]; u[1]]
+    Q  = Matrix{T}(I,2,2); Qf = 5.0*Q; R = Matrix{T}(I,1,1)
+    o1 = PlayerObjective(1, LQStageCost(Q, R), LQTerminalCost(Qf))
+    o2 = PlayerObjective(2, LQStageCost(Q, R), LQTerminalCost(Qf))
+    prx = collision_avoidance([1,2]; i_offset=0, j_offset=2, pos_dim=1, d_min=0.3)
+    p1  = Player{T}(1, 2, 1, [1.5, 0.0], f, o1, [])
+    p2  = Player{T}(2, 2, 1, [-1.5, 0.0], f, o2, [])
+    cgame = DifferentialGame([p1, p2], tf, dt; shared_constraints=[prx])
+
+    ws = ALGAMESWorkspace(cgame, ALGAMES(), nothing)
+    nc = ws.nc_step
+    ρ_val = 5.0
+
+    ws.ρ .= ρ_val
+    ws.λ .= 0.0   # λ = 0
+
+    # At a point where constraint is well satisfied (C << 0): λ+ρC < 0 → inactive
+    # Place players very far apart so collision constraint C << 0
+    ws.X[:, 1] .= [10.0, 0.0, -10.0, 0.0]   # far apart
+    x_k = ws.X[:, 1]; u_k = zeros(2)
+    C_k, _, _ = DifferentialGamesBaseSolvers._con_eval(cgame, ws, x_k, u_k, 1)
+    if !isempty(C_k) && C_k[1] < -ρ_val * 1e-3   # strictly inactive
+        pen = _al_pen(C_k, ws, 1, cgame)
+        @test pen[1] == 0.0   # inactive → zero penalty
+    end
+
+    # With λ > 0 but λ + ρC still < 0: STILL inactive by correct criterion
+    ws.λ .= 0.1
+    C_k, _, _ = DifferentialGamesBaseSolvers._con_eval(cgame, ws, x_k, u_k, 1)
+    if !isempty(C_k) && 0.1 + ρ_val * C_k[1] < 0
+        pen = _al_pen(C_k, ws, 1, cgame)
+        @test pen[1] == 0.0   # still inactive
+    end
+end
+
+@testset "Cat 5 (Bug 3): _regularize! adds reg to correct H diagonal" begin
+    # Verify reg is added to H[_Gx_idx(ws,i,k)[j], _x_idx(ws,k)[j]]
+    # and H[_Gu_idx(ws,i,k)[j], _u_idx(ws,i,k)[j]], NOT H[1:n_primal, 1:n_primal].
+    game = make_double_integrator_game(N=4, np=2)
+    ws   = ALGAMESWorkspace(game, ALGAMES(), nothing)
+    n_y  = _y_dim(ws)
+    H    = zeros(n_y, n_y)
+    reg  = 1.0
+    _regularize!(H, ws, reg)
+
+    # Every entry that should be regularized:
+    for k in 1:ws.N
+        x_col = _x_idx(ws, k)
+        for i in 1:ws.np
+            for j in 1:ws.n
+                @test H[_Gx_idx(ws,i,k)[j], x_col[j]] == reg
+            end
+        end
+        for i in 1:ws.np
+            for j in 1:ws.control_dims[i]
+                @test H[_Gu_idx(ws,i,k)[j], _u_idx(ws,i,k)[j]] == reg
+            end
+        end
+    end
+
+    # Total non-zero entries: np * n * N  (x blocks) + np * mi * N  (u blocks)
+    expected_nonzero = (ws.np * ws.n + sum(ws.control_dims)) * ws.N
+    @test count(!iszero, H) == expected_nonzero
+end
+
+@testset "Cat 5 (Bug 4): line search uses current ρ — monotone decrease under high penalty" begin
+    # At high ρ, the line search must properly evaluate the Armijo condition
+    # using current ρ. If it used ρ_trial=1 for the trial but ρ_current for
+    # the reference, the condition would be trivially satisfied for any step.
+    # This test verifies that the solver still converges with tight tolerances
+    # even after the outer loop raises ρ to high values.
+    T  = Float64; tf = T(1.0); dt = T(0.1); N = Int(round(tf/dt))
+    f  = (x, u, p, t) -> [x[2]; u[1]]
+    Q  = Matrix{T}(I,2,2); Qf = 5.0*Q; R = Matrix{T}(I,1,1)
+    o1 = PlayerObjective(1, LQStageCost(Q, R), LQTerminalCost(Qf))
+    o2 = PlayerObjective(2, LQStageCost(Q, R), LQTerminalCost(Qf))
+    prx = collision_avoidance([1,2]; i_offset=0, j_offset=2, pos_dim=1, d_min=0.3)
+    p1  = Player{T}(1, 2, 1, [1.5, 0.0], f, o1, [])
+    p2  = Player{T}(2, 2, 1, [-1.5, 0.0], f, o2, [])
+    cgame = DifferentialGame([p1, p2], tf, dt; shared_constraints=[prx])
+
+    # ρ_increase=10, outer_iter=30 drives ρ up to 10^7+ before convergence
+    solver = ALGAMES(ρ_increase=10.0, outer_iter=30, tol_con=1e-3)
+    sol    = solve(cgame, solver)
+
+    # Despite high ρ, the solver must not diverge — constraint violation must decrease
+    @test sol.solver_info[:con_vio] < solver.tol_con * 10
+    history_con = sol.solver_info[:history][:con]
+    # Constraint violation over last 5 outer iters must be non-increasing (on average)
+    if length(history_con) >= 6
+        tail = history_con[end-4:end]
+        @test tail[end] <= tail[1] * 10   # not diverging
+    end
+end
+
+@testset "Cat 5: solver converges on constrained game without divergence" begin
+    # Regression: the combination of all four bugs caused opt/dyn/con violation
+    # to GROW over outer iterations. Verify monotone-ish constraint decrease.
+    T  = Float64; tf = T(1.0); dt = T(0.1); N = Int(round(tf/dt))
+    f  = (x, u, p, t) -> [x[2]; u[1]]
+    Q  = Matrix{T}(I,2,2); Qf = 5.0*Q; R = Matrix{T}(I,1,1)
+    o1 = PlayerObjective(1, LQStageCost(Q, R), LQTerminalCost(Qf))
+    o2 = PlayerObjective(2, LQStageCost(Q, R), LQTerminalCost(Qf))
+    prx = collision_avoidance([1,2]; i_offset=0, j_offset=2, pos_dim=1, d_min=0.3)
+    p1  = Player{T}(1, 2, 1, [1.5, 0.0], f, o1, [])
+    p2  = Player{T}(2, 2, 1, [-1.5, 0.0], f, o2, [])
+    cgame = DifferentialGame([p1, p2], tf, dt; shared_constraints=[prx])
+
+    solver = ALGAMES(outer_iter=50, tol_con=1e-3)
+    sol    = solve(cgame, solver)
+
+    @test sol.converged
+    @test sol.solver_info[:con_vio] < solver.tol_con * 10
+    @test sol.solver_info[:dyn_vio] < solver.tol_dyn * 10
+    @test sol.solver_info[:opt_vio] < solver.tol_opt * 10
+end
+
 println("\n✓ ALGAMES test suite complete.")

@@ -125,12 +125,14 @@ Preallocated buffers for one Newton iteration.
 `G` (residual) and `H` (Jacobian) are overwritten each call.
 """
 mutable struct ALGAMESBuffers{T}
-    G::Vector{T}
-    H::Matrix{T}
+    G      ::Vector{T}
+    H      ::Matrix{T}
+    y      ::Vector{T}      # pre-allocated pack_y! buffer (avoids alloc each inner iter)
+    y_trial::Vector{T}      # pre-allocated line-search trial vector
 end
 
 ALGAMESBuffers(::Type{T}, n_y::Int) where {T} =
-    ALGAMESBuffers{T}(zeros(T, n_y), zeros(T, n_y, n_y))
+    ALGAMESBuffers{T}(zeros(T, n_y), zeros(T, n_y, n_y), zeros(T, n_y), zeros(T, n_y))
 
 # ============================================================================
 # y-vector dimensions and index helpers
@@ -260,6 +262,25 @@ function _pack_y(ws::ALGAMESWorkspace{T}) where {T}
 end
 
 """
+    _pack_y!(y, ws)
+
+In-place version of `_pack_y`. Writes the current iterate into pre-allocated `y`.
+Avoids allocation in the Newton inner loop and line search.
+"""
+function _pack_y!(y::AbstractVector{T}, ws::ALGAMESWorkspace{T}) where {T}
+    for k in 1:ws.N
+        y[_x_idx(ws, k)] .= ws.X[:, k+1]
+    end
+    for i in 1:ws.np, k in 1:ws.N
+        y[_u_idx(ws, i, k)] .= ws.U[i][:, k]
+    end
+    for i in 1:ws.np, k in 1:ws.N
+        y[_λdyn_idx(ws, i, k)] .= ws.Λ_dyn[i][:, k]
+    end
+    return nothing
+end
+
+"""
     _unpack_y(ws_ref, y) -> ALGAMESWorkspace{S}
 
 Unpack y into a workspace.  Fixed quantities (x₀, λ, ρ, dims) come from ws_ref.
@@ -350,9 +371,14 @@ Boundary condition at k=1:
   stage-cost-at-xₖ contributions; the x(k+1) = x(2) row gets the
   Aₖᵀ λᵢ₁ and −λᵢ₁ terms from step k=1.
 """
-function _G_into!(G ::AbstractVector{S},
-                  game::GameProblem{T},
-                  ws  ::ALGAMESWorkspace{S}) where {T, S}
+function _G_into!(G       ::AbstractVector{S},
+                  game    ::GameProblem{T},
+                  ws      ::ALGAMESWorkspace{S};
+                  Ak_list ::Union{Nothing, Vector{<:AbstractMatrix}} = nothing,
+                  Bk_list ::Union{Nothing, Vector{<:AbstractMatrix}} = nothing,
+                  Jcx_list::Union{Nothing, Vector{<:AbstractMatrix}} = nothing,
+                  Jcu_list::Union{Nothing, Vector{<:AbstractMatrix}} = nothing,
+) where {T, S}
     n, np, N = ws.n, ws.np, ws.N
     cdim     = ws.control_dims
     coff     = ws.control_offsets
@@ -376,10 +402,35 @@ function _G_into!(G ::AbstractVector{S},
         # ── Discrete dynamics Jacobian ∂x_next/∂x and ∂x_next/∂u ─────────
         # TRANSPOSE AUDIT: Ak = ∂x_next/∂x, Bk = ∂x_next/∂u.
         # Only Aₖᵀ and Bᵢₖᵀ appear in the residual — never plain Aₖ.
-        Ak, Bk = _dyn_jac_discrete(game.dynamics, x_k, u_k, n, k, dt)
+        #
+        # GN mode: use precomputed Float64 Jacs directly (no S.() conversion).
+        # Julia's matrix-vector multiply promotes types automatically:
+        #   Float64_matrix' × Dual_vector → Dual_vector  (via generic fallback)
+        # so wrapping Ak/Bk into Dual matrices is unnecessary and wasteful.
+        Ak, Bk = if Ak_list !== nothing
+            Ak_list[k], Bk_list[k]   # Float64 — no conversion needed
+        else
+            _dyn_jac_discrete(game.dynamics, x_k, u_k, n, k, dt)
+        end
 
         # ── Constraint evaluation and AL penalty ──────────────────────────
-        C_k, Jcx_k, Jcu_k = _con_eval(game, ws, x_k, u_k, k)
+        # GN mode: evaluate C_k via direct constraint call (no inner ForwardDiff
+        # for Jacobians); use precomputed Jcx_list/Jcu_list as Float64 constants.
+        # The outer AD differentiates through evaluate_constraint for C_k naturally,
+        # giving ∂pen_k/∂x_k = ρ_k * Jcx_k without nested dual numbers.
+        # No S.() conversion: Float64_matrix' × S_vector works natively.
+        C_k, Jcx_k, Jcu_k = if Jcx_list !== nothing
+            C_vals = if ws.nc_step > 0
+                vcat([evaluate_constraint(c, x_k, u_k, nothing, k)
+                      for c in Iterators.flatten((game.private_constraints,
+                                                  game.shared_constraints))]...)
+            else
+                S[]
+            end
+            C_vals, Jcx_list[k], Jcu_list[k]   # Float64 — no conversion needed
+        else
+            _con_eval(game, ws, x_k, u_k, k)
+        end
         pen_k = _al_pen(C_k, ws, k, game)
 
         # ── Per-player stationarity ───────────────────────────────────────
@@ -491,22 +542,88 @@ function _G_into!(G ::AbstractVector{S},
 end
 
 # ============================================================================
-# _build_jacobian!  via ForwardDiff
+# _build_jacobian!  via ForwardDiff (Gauss-Newton variant)
 # ============================================================================
+
+"""
+    _precompute_step_jacs(game, ws) -> (Ak_list, Bk_list, Jcx_list, Jcu_list)
+
+Evaluate dynamics and constraint Jacobians at the current iterate as plain
+`Float64` arrays (one entry per timestep k = 1:N).
+
+Used by `_build_jacobian!` to implement the **Gauss-Newton Jacobian**:
+the precomputed matrices are passed as frozen constants into `_G_into!`,
+which prevents nested ForwardDiff (Dual{Dual{T}}) during the outer AD sweep.
+
+What we gain vs. the full exact Jacobian:
+  • No inner `ForwardDiff.jacobian` calls inside the outer sweep → no Dual{Dual{T}}.
+  • For linear dynamics (all current test cases) the dropped second-order terms
+    ∂Aₖ/∂x · λ are exactly zero → GN = exact.
+  • For nonlinear dynamics / constrained cases the outer AD still differentiates
+    through `_discrete_step` and `evaluate_constraint`, recovering the first-order
+    (Gauss-Newton) approximation exactly. The AL outer loop provides robustness
+    for the dropped second-order curvature terms.
+"""
+function _precompute_step_jacs(
+    game::GameProblem{T},
+    ws  ::ALGAMESWorkspace{T},
+) where {T}
+    N  = ws.N
+    n  = ws.n
+    m  = sum(ws.control_dims)
+    dt = T(game.time_horizon.dt)
+    U_flat = _concat_controls(ws)
+
+    Ak_list  = Vector{Matrix{T}}(undef, N)
+    Bk_list  = Vector{Matrix{T}}(undef, N)
+    Jcx_list = Vector{Matrix{T}}(undef, N)
+    Jcu_list = Vector{Matrix{T}}(undef, N)
+
+    for k in 1:N
+        x_k = ws.X[:, k]
+        u_k = U_flat[:, k]
+        Ak_list[k], Bk_list[k] = _dyn_jac_discrete(game.dynamics, x_k, u_k, n, k, dt)
+        if ws.nc_step > 0
+            _, Jcx_list[k], Jcu_list[k] = _con_eval(game, ws, x_k, u_k, k)
+        else
+            Jcx_list[k] = Matrix{T}(undef, 0, n)
+            Jcu_list[k] = Matrix{T}(undef, 0, m)
+        end
+    end
+    return Ak_list, Bk_list, Jcx_list, Jcu_list
+end
 
 """
     _build_jacobian!(buf, game, ws)
 
-Compute H = ∂G/∂y via ForwardDiff.jacobian through _G_from_y.
+Compute H = ∂G/∂y via the Gauss-Newton ForwardDiff path.
 
-Note: G and y have different orderings (see file header), so H is NOT block-
-diagonal. ForwardDiff handles this correctly.
+Steps:
+  1. Precompute (Ak, Bk, Jcx_k, Jcu_k) as Float64 at the current iterate.
+  2. Run `ForwardDiff.jacobian` through `_G_into!` with those matrices frozen
+     as constants → no nested AD, no Dual{Dual{T}} numbers.
+
+For unconstrained linear-dynamics problems the result is identical to the full
+exact Jacobian (since there are no inner ForwardDiff calls in that case anyway).
+For constrained / nonlinear problems the result is the Gauss-Newton Jacobian,
+which drops second-order curvature terms but is several times cheaper to compute.
 """
 function _build_jacobian!(buf::ALGAMESBuffers{T},
                            game::GameProblem{T},
                            ws  ::ALGAMESWorkspace{T}) where {T}
-    y0 = _pack_y(ws)
-    buf.H .= ForwardDiff.jacobian(y -> _G_from_y(game, ws, y), y0)
+    Ak_list, Bk_list, Jcx_list, Jcu_list = _precompute_step_jacs(game, ws)
+    _pack_y!(buf.y, ws)
+    f_gn = y -> begin
+        ws_tmp = _unpack_y(ws, y)
+        G_tmp  = zeros(eltype(y), _G_dim(ws))
+        _G_into!(G_tmp, game, ws_tmp;
+                 Ak_list  = Ak_list,
+                 Bk_list  = Bk_list,
+                 Jcx_list = Jcx_list,
+                 Jcu_list = Jcu_list)
+        G_tmp
+    end
+    buf.H .= ForwardDiff.jacobian(f_gn, buf.y)
 end
 
 """
@@ -543,20 +660,36 @@ end
 """
     _regularize!(H, ws, reg)
 
-Add reg·I to the PRIMAL rows of H only (state x and control u blocks).
-The dynamics-multiplier rows (Λ_dyn) are NOT regularised.
+Add reg to the self-derivative diagonal blocks of H for primal variables.
 
-This matches the reference Algames.jl regularize_residual_jacobian! which
-adds reg only to the (x,x) and (u,u) diagonal blocks — not to the (λ,λ)
-block. Regularising the dynamics-multiplier rows corrupts the dynamics
-residual, which is already linear in the multipliers.
+H = ∂G/∂y where G rows are in per-player interleaved order and y columns
+are in separated order (x first, then U, then Λ_dyn). These differ, so
+H[i,i] does NOT correspond to self-derivatives for i > n.
+
+Correct placement (matching reference regularize_residual_jacobian!):
+  H[_Gx_idx(ws,i,k)[j], _x_idx(ws,k)[j]]   += reg   for all i, k, j
+  H[_Gu_idx(ws,i,k)[j], _u_idx(ws,i,k)[j]] += reg   for all i, k, j
+
+The dynamics-multiplier rows (Λ_dyn) are NOT regularised — dynamics
+residual is linear in multipliers so those rows are already well-conditioned.
 """
 function _regularize!(H::Matrix{T}, ws::ALGAMESWorkspace, reg::Float64) where {T}
     r = T(reg)
-    # Primal rows: first n*N (state) + sum(cdim)*N (control) entries of y
-    n_primal = (ws.n + sum(ws.control_dims)) * ws.N
-    @inbounds for i in 1:n_primal
-        H[i, i] += r
+    for k in 1:ws.N
+        x_col = _x_idx(ws, k)
+        for i in 1:ws.np
+            gx_row = _Gx_idx(ws, i, k)
+            @inbounds for j in 1:ws.n
+                H[gx_row[j], x_col[j]] += r
+            end
+        end
+        for i in 1:ws.np
+            gu_row = _Gu_idx(ws, i, k)
+            uy_col = _u_idx(ws, i, k)
+            @inbounds for j in 1:ws.control_dims[i]
+                H[gu_row[j], uy_col[j]] += r
+            end
+        end
     end
 end
 
@@ -565,61 +698,42 @@ end
 # ============================================================================
 
 """
-    _line_search(game, ws, G_norm_1, δy, solver) -> α
+    _line_search(game, ws, buf, G_norm_1, δy, solver) -> α
 
 Armijo backtracking: find α ∈ (0,1] such that
   ‖G_trial(y + α·δy)‖₁ ≤ (1 − α·β) · ‖G(y)‖₁
 
-Trial residuals are evaluated with ρ clamped to ρ_init (the fixed
-`ρ_trial = 1.0` of the reference). This keeps the line search
-well-conditioned as the AL penalty grows in the outer loop — matching
-the reference Algames.jl line_search which uses prob.pen.ρ_trial (fixed)
-rather than the current prob.pen.ρ (growing).
+Both the reference norm G_norm_1 (passed in) and the trial residuals are
+evaluated with the CURRENT ρ from ws. This matches the reference
+Algames.jl line_search where residual! uses the current prob.pen.ρ for
+both the reference and trial evaluations, giving a consistent Armijo
+condition throughout the outer loop.
+
+`buf.y` and `buf.y_trial` are pre-allocated vectors (size n_y) used to
+avoid heap allocation in this hot-path function.
 """
 function _line_search(
     game    ::GameProblem{T},
     ws      ::ALGAMESWorkspace{T},
+    buf     ::ALGAMESBuffers{T},
     G_norm_1::T,
     δy      ::Vector{T},
     solver  ::ALGAMES
 ) where {T}
-    β  = T(solver.ls_beta)
-    τ  = T(solver.ls_tau)
-    α  = one(T)
-
-    # Build a copy of ws with ρ clamped to ρ_init for trial evaluations.
-    # This matches the reference ρ_trial = 1.0 — the line search merit
-    # function uses a fixed small penalty so α doesn't collapse as ρ grows.
-    ρ_trial = fill(T(solver.ρ_init), length(ws.ρ))
+    β = T(solver.ls_beta)
+    τ = T(solver.ls_tau)
+    α = one(T)
+    _pack_y!(buf.y, ws)
 
     for _ in 1:solver.ls_iter
-        y_trial = _pack_y(ws) .+ α .* δy
-        G_trial = _G_from_y_with_rho(game, ws, y_trial, ρ_trial)
+        buf.y_trial .= buf.y .+ α .* δy
+        G_trial = _G_from_y(game, ws, buf.y_trial)
         if norm(G_trial, 1) ≤ (1 - α * β) * G_norm_1
             return α
         end
         α *= τ
     end
     return α
-end
-
-"""
-    _G_from_y_with_rho(game, ws_ref, y, ρ_override) -> Vector{S}
-
-Like _G_from_y but uses ρ_override instead of ws_ref.ρ.
-Used by line search to evaluate trial residuals at fixed ρ_trial.
-"""
-function _G_from_y_with_rho(
-    game     ::GameProblem{T},
-    ws_ref   ::ALGAMESWorkspace{T},
-    y        ::AbstractVector{T},
-    ρ_trial  ::Vector{T}
-) where {T}
-    ws_tmp      = _unpack_y(ws_ref, y)
-    ws_tmp.ρ   .= ρ_trial
-    G_tmp       = zeros(T, _G_dim(ws_ref))
-    _G_into!(G_tmp, game, ws_tmp)
-    return G_tmp
 end
 
 # ============================================================================
@@ -710,6 +824,19 @@ end
 
 Evaluate all constraints + Jacobians at (x_k, u_k, k).
 Returns empty arrays of correct shape when nc_step == 0.
+
+Implementation note: uses `constraint_jacobian(c, ...)` (analytical) instead
+of `ForwardDiff.jacobian` through `evaluate_constraint`.  This eliminates the
+inner ForwardDiff that previously caused 5 k allocations per call.
+
+This is safe because `_con_eval` is only called with **Float64 inputs**:
+  • `_precompute_step_jacs`  — always Float64
+  • `_G_into!` without precomputed Jacs  — residual / line-search, always Float64
+
+The old concern about `constraint_jacobian` not being ForwardDiff-compatible
+with Dual inputs no longer applies: the GN Jacobian path (`_build_jacobian!`)
+passes precomputed Float64 Jacs as frozen constants and never calls `_con_eval`
+with Dual x_k/u_k.
 """
 function _con_eval(game::GameProblem{T},
                    ws  ::ALGAMESWorkspace{S},
@@ -727,22 +854,8 @@ function _con_eval(game::GameProblem{T},
     Jcu_list = Matrix{S}[]
 
     for c in Iterators.flatten((game.private_constraints, game.shared_constraints))
-        cv = evaluate_constraint(c, x_k, u_k, nothing, k)
-
-        # Use ForwardDiff through evaluate_constraint for the Jacobian rather than
-        # calling constraint_jacobian(c, ...) directly.  Some constraints (e.g.
-        # ProximityConstraint) have analytical Jacobians that pre-allocate Float64
-        # output arrays and are not ForwardDiff-compatible when x_k/u_k carry
-        # dual numbers (as they do inside _build_jacobian!).  Differentiating
-        # through evaluate_constraint is always correct and type-compatible.
-        z = vcat(x_k, u_k)
-        J = ForwardDiff.jacobian(
-            z_var -> evaluate_constraint(c, z_var[1:n], z_var[n+1:end], nothing, k),
-            z
-        )
-        Jx = J[:, 1:n]
-        Ju = J[:, n+1:end]
-
+        cv      = evaluate_constraint(c, x_k, u_k, nothing, k)
+        Jx, Ju  = constraint_jacobian(c,   x_k, u_k, nothing, k)
         push!(C_list, cv);   push!(Jcx_list, Jx);   push!(Jcu_list, Ju)
     end
 
@@ -752,10 +865,14 @@ end
 """
     _al_pen(C_k, ws, k, game) -> pen_k
 
-Compute active-set AL penalty Iᵨ·(λ + ρ·C) for step k (Eq. 5).
+Compute active-set AL penalty vector for step k.
 
-  Inactive inequality (C_j < 0 AND λ_j ≈ 0): pen_j = 0
-  Otherwise:                                   pen_j = ρ_j·(λ_j + ρ_j·C_j)
+For both equalities and active inequalities: pen_j = λ_j + ρ_j·C_j
+For inactive inequalities (λ_j + ρ_j·C_j < 0):  pen_j = 0  (Eq. 5)
+
+This is the standard augmented Lagrangian gradient factor:
+  ∂/∂x [λᵀC + (ρ/2)‖C‖²] = (λ + ρC)ᵀ ∂C/∂x,
+so pen = λ + ρC (no extra ρ factor).
 """
 function _al_pen(C_k ::AbstractVector{S},
                  ws  ::ALGAMESWorkspace{S},
@@ -774,13 +891,11 @@ function _al_pen(C_k ::AbstractVector{S},
     for c in Iterators.flatten((game.private_constraints, game.shared_constraints))
         nc = _nc_con(c, n, m)
         for j in 1:nc
-            g  = off + j
-            λj = λ_k[g];  ρj = ρ_k[g];  Cj = C_k[g]
-            if is_inequality(c) && Cj < zero(S) && abs(λj) < 1e-14
-                pen[g] = zero(S)   # inactive: Eq. (5)
-            else
-                pen[g] = ρj * (λj + ρj * Cj)
-            end
+            g   = off + j
+            λj  = λ_k[g];  ρj = ρ_k[g];  Cj = C_k[g]
+            val = λj + ρj * Cj
+            # Active-set AL: inactive when λ + ρC < 0 (standard criterion, Eq. 5)
+            pen[g] = (is_inequality(c) && val < zero(S)) ? zero(S) : val
         end
         off += nc
     end

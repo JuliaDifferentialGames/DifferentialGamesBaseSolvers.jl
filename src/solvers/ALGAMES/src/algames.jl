@@ -286,7 +286,7 @@ function _solve(
             _regularize!(buf.H, ws, Float64(reg_l))
 
             δy = _newton_step(buf.H, buf.G)
-            α  = _line_search(game, ws, G_norm, δy, solver)
+            α  = _line_search(game, ws, buf, G_norm, δy, solver)
             _apply_step!(ws, δy, T(α))
 
             _build_residual!(buf, game, ws)
