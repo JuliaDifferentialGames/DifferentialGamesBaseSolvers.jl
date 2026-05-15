@@ -3,6 +3,22 @@
 # (diagnostic prints added in correct positions — NOT inside player loop)
 # ============================================================================
 
+"""
+    FNELQ(; check_singularity=true, rcond_threshold=1e-10, regularization=0.0)
+
+Feedback Nash Equilibrium LQ (FNELQ) solver.
+
+Computes the exact, closed-form feedback Nash equilibrium for finite-horizon discrete-time
+LQ games by solving the coupled backward Riccati recursion in a single pass. No iteration
+required; the solution is exact up to floating-point precision.
+
+Applicable to `LQGameProblem`, `LTVLQGameProblem`, and `PDGNEProblem` with LQ costs.
+
+# Options
+- `check_singularity`: warn when the Nash gain matrix is ill-conditioned
+- `rcond_threshold`: reciprocal condition number below which a warning is issued
+- `regularization`: Tikhonov regularization added to the gain system
+"""
 struct FNELQ <: GameSolver
     check_singularity::Bool
     rcond_threshold::Float64
