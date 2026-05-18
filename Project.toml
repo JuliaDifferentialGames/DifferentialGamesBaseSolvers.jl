@@ -20,7 +20,7 @@ DifferentialGamesBaseSolversPlotsExt = "Plots"
 
 [compat]
 DiffResults = "1.1.0"
-DifferentialGamesBase = "1.0.0"
+DifferentialGamesBase = "0.1.0"
 ForwardDiff = "1.3.3"
 LinearAlgebra = "1.11.0"
 Plots = "1.41.6"
