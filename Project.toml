@@ -1,7 +1,7 @@
 name = "DifferentialGamesBaseSolvers"
 uuid = "b83b0c57-42fa-43ab-a182-d5be40f43772"
 authors = ["BennetOutland <bennet.outland@pm.me> and contributors"]
-version = "1.0.0-DEV"
+version = "0.1.0"
 
 [deps]
 DiffResults = "163ba53b-c6d8-5494-b064-1a9d43ac40c5"
@@ -20,7 +20,7 @@ DifferentialGamesBaseSolversPlotsExt = "Plots"
 
 [compat]
 DiffResults = "1.1.0"
-DifferentialGamesBase = "1"
+DifferentialGamesBase = "0.1"
 ForwardDiff = "1.3.3"
 LinearAlgebra = "1.11.0"
 Plots = "1.41.6"
