@@ -25,8 +25,20 @@ include("solvers/FNELQ/src/fnelq.jl")
 include("solvers/iLQGames/src/ilqgames.jl")
 
 # ALGAMES
-include("solvers/ALGAMES/src/algames.jl")   
+include("solvers/ALGAMES/src/algames.jl")
 include("solvers/ALGAMES/src/utils.jl")
+
+# L-IBR
+include("solvers/LIBR/src/libr.jl")
+
+# Yi & Pavel — Distributed Primal-Dual GNE
+include("solvers/YIPAVEL/src/yipavel.jl")
+
+# Inga et al. — Inverse LQ Differential Games
+include("solvers/INVLQ/src/invlq.jl")
+
+# Receding Horizon Nash wrapper (wraps any inner GameSolver)
+include("solvers/RHN/src/rhn.jl")
 
 # ============================================================================
 # Visualisation stubs (implementations live in the Plots weak-dep extension)
@@ -86,6 +98,10 @@ end
 export FNELQ
 export iLQGames
 export ALGAMES
+export LIBR
+export YiPavel
+export InverseLQGames
+export RecedingHorizonNash
 export animate_solution
 export save_animation
 
