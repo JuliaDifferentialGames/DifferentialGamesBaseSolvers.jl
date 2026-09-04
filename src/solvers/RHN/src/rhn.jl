@@ -175,13 +175,51 @@ function _shift_open_loop_strategy(strat::OpenLoopStrategy{T}) where {T}
 end
 
 """
+    _shift_trajectories(trajs) -> Vector{Trajectory{T}}
+
+Shift each player's trajectory forward by one step for warm-starting, preserving the
+node count exactly:
+  states  (n_x × N+1): columns 2…N+1, then repeat the terminal state.
+  controls(n_u × N)  : columns 2…N,   then repeat the terminal control.
+
+Length preservation is REQUIRED, not cosmetic: FALCON's `_extract_flat_trajectory`
+indexes `U[:, 1:N]` / `X[:, 1:N+1]` with no resampling and throws a `BoundsError` on a
+short seed. `times` are window-local and therefore unchanged, matching the convention in
+`_shift_feedback_strategy`/`_shift_open_loop_strategy` above.
+
+The stale first column is harmless: the consumer overwrites node 1 with the true measured
+initial state before solving.
+"""
+function _shift_trajectories(trajs::Vector{Trajectory{T}}) where {T}
+    map(trajs) do tr
+        N = size(tr.controls, 2)
+        if N > 1
+            new_states   = hcat(tr.states[:, 2:N+1], tr.states[:, N+1:N+1])
+            new_controls = hcat(tr.controls[:, 2:N], tr.controls[:, N:N])
+        else
+            new_states   = copy(tr.states)      # N=1: no shift possible
+            new_controls = copy(tr.controls)
+        end
+        Trajectory{T}(tr.player_id, new_states, new_controls, copy(tr.times), tr.cost)
+    end
+end
+
+"""
     _shift_warmstart(sol::GNEPSolution{T}) -> WarmstartData{T}
 
 Build a warm-start for the next sub-problem from a converged solution.
 
-The strategy (if present) is shifted forward by one step.
-Dual variables are forwarded as-is so constrained solvers (ALGAMES)
-can continue from their previous multiplier estimates.
+The previous solution's TRAJECTORIES and strategy are both shifted forward by one step.
+Dual variables are forwarded so constrained solvers (ALGAMES, FALCON) can continue from
+their previous multiplier estimates.
+
+NOTE (bug fix): this previously passed `nothing` for `trajectories` and looked duals up
+under `:dual_variables` — a key FALCON does not emit (it emits `:λ` / `:dual_variables_λ`).
+The result was that `warm_start=true` was a silent no-op: every receding-horizon window
+fell through to FALCON's zero-control cold rollout (`_init_flat_trajectory`) with no dual
+warm start, which is the entire point of a receding-horizon loop. Consumers all guard with
+`isnothing`/length checks (see FALCON's `_try_load_dual!`), so supplying real data here is
+backward compatible.
 """
 function _shift_warmstart(sol::GNEPSolution{T}) where {T}
     shifted_strat = if sol.strategy isa FeedbackStrategy
@@ -192,10 +230,20 @@ function _shift_warmstart(sol::GNEPSolution{T}) where {T}
         nothing
     end
 
-    # Carry dual variables (ALGAMES uses these for warm-starting multipliers)
-    duals = get(sol.solver_info, :dual_variables, nothing)
+    shifted_trajs = isnothing(sol.trajectories) ? nothing : _shift_trajectories(sol.trajectories)
 
-    return WarmstartData{T}(nothing, shifted_strat, duals, Dict{Symbol, Any}())
+    # Carry dual variables. Try the generic key first, then the keys FALCON actually
+    # emits; wrap in a Dict{Symbol,Any} so downstream `haskey` lookups work uniformly.
+    duals = get(sol.solver_info, :dual_variables, nothing)
+    if isnothing(duals)
+        d = Dict{Symbol, Any}()
+        for k in (:λ, :dual_variables_λ, :μ)
+            haskey(sol.solver_info, k) && (d[k] = sol.solver_info[k])
+        end
+        duals = isempty(d) ? nothing : d
+    end
+
+    return WarmstartData{T}(shifted_trajs, shifted_strat, duals, Dict{Symbol, Any}())
 end
 
 # ============================================================================

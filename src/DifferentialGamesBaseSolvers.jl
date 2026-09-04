@@ -40,6 +40,9 @@ include("solvers/INVLQ/src/invlq.jl")
 # Receding Horizon Nash wrapper (wraps any inner GameSolver)
 include("solvers/RHN/src/rhn.jl")
 
+# Dynamic Tube MPC solver (extends RHN with robust tube optimization)
+include("solvers/DTRHN/src/dtmpc.jl")
+
 # ============================================================================
 # Visualisation stubs (implementations live in the Plots weak-dep extension)
 #
@@ -102,6 +105,55 @@ export LIBR
 export YiPavel
 export InverseLQGames
 export RecedingHorizonNash
+export DynamicTubeMPC
+export DynamicTubeMPCProblem
+export DynamicTubeMPCSolution
+export DTMPCParameters
+export TubeChannel
+# DTMPC builders (augmented PD-GNEP)
+export build_augmented_player_dynamics_discrete
+export build_augmented_cost
+export build_tightened_collision_constraint
+export build_tightened_actuator_constraint
+export build_tightened_rot_actuator_constraint
+export build_tightened_detection_constraint
+export build_initial_containment_constraint
+export build_augmented_game
+# DTMPC layout / accessors
+export augmented_state_dims
+export agent_physical_block
+export extract_agent_augmented
+export block_offsets
+export n_tube_channels_agent
+export tube_channels
+export uses_multi_tube
+export ρ_of
+export tube_delta_hat
+export dtmpc_free_initial_mask
+export augmented_control_dims
+export dtmpc_bandwidth_trajectory
+# DTMPC utility functions
+export lsh_boundary_layer_control
+export lsh_rotational_boundary_layer_control
+export tighten_coupled_distance
+export check_coupled_constraint_satisfaction
+export create_independent_uncertainty_models
+export create_coupled_uncertainty_models
+export default_drag_uncertainty
+export default_coupled_drag_uncertainty
+export validate_coupled_constraints
+export get_coupled_constraint_violations
+export all_coupled_constraints_satisfied
+# DTMPC accessor functions
+export dtmpc_state_trajectory
+export dtmpc_control_trajectory
+export dtmpc_tube_trajectory
+export dtmpc_total_cost
+export dtmpc_n_players
+export dtmpc_state_dim
+export dtmpc_agent_state_dim
+export dtmpc_simulation_steps
+export dtmpc_coupled_pairs
 export animate_solution
 export save_animation
 
