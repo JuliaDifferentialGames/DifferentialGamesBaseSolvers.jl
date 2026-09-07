@@ -516,6 +516,53 @@ end
         @test sol.converged == false
     end
 
+    @testset "recovery_callback: nothing behaves identically to no callback" begin
+        T = Float64
+        n = 2
+        params = make_params(n; s₀ = fill(T(10.0), n), α_fixed = fill(T(1.0), n),
+                              tighten_actuator = true, actuator_max = fill(T(0.01), n))
+        game = make_pdgnep_di(; n_players = n, N_win = 8)
+        um = create_independent_uncertainty_models(x -> T(0.05), n)
+        x0 = vcat([T[Float64(i), 0.0] for i in 1:n]...)
+        N_sim = 5
+        prob = DynamicTubeMPCProblem(game, x0, N_sim, params, um)
+
+        always_nothing(; kwargs...) = nothing
+        sol = solve(prob, DynamicTubeMPC(make_falcon(); recovery_callback = always_nothing); verbose = false)
+
+        @test sol.solver_info[:terminated_early] == true
+        @test sol.converged == false
+    end
+
+    @testset "recovery_callback: a genuinely feasible recovery lets the window complete" begin
+        # SAME structurally-infeasible setup as the failure-path guard test above (guaranteed
+        # double-failure at the primary actuator_max=0.01), but the recovery_callback rebuilds
+        # the SAME game against a relaxed (trivially feasible) DTMPCParameters and hands DTMPC
+        # a genuinely converged solution -- exercising the full recovery path end-to-end.
+        T = Float64
+        n = 2
+        hard_params = make_params(n; s₀ = fill(T(10.0), n), α_fixed = fill(T(1.0), n),
+                                   tighten_actuator = true, actuator_max = fill(T(0.01), n))
+        easy_params = make_params(n; tighten_actuator = false)
+        game = make_pdgnep_di(; n_players = n, N_win = 8)
+        um = create_independent_uncertainty_models(x -> T(0.05), n)
+        x0 = vcat([T[Float64(i), 0.0] for i in 1:n]...)
+        N_sim = 5
+        prob = DynamicTubeMPCProblem(game, x0, N_sim, hard_params, um)
+
+        function relax_and_retry(; step, current_x, s_cur, carried_widths, carried_alphas, warmstart, aug_game, game)
+            aug_easy = build_augmented_game(game, easy_params, um, current_x, s_cur;
+                                             discrete = true, carried_widths = carried_widths, carried_alphas = carried_alphas)
+            return DifferentialGamesBase.solve(aug_easy, make_falcon(); warmstart = warmstart, verbose = false, check_compatibility = false)
+        end
+        sol = solve(prob, DynamicTubeMPC(make_falcon(); recovery_callback = relax_and_retry); verbose = false)
+
+        @test sol.solver_info[:terminated_early] == false
+        @test sol.solver_info[:n_steps_simulated] == N_sim
+        @test sol.converged == true
+        @test all(isfinite, sol.X)
+    end
+
     # ── display ─────────────────────────────────────────────────────────────
     @testset "Display" begin
         prob, _, _ = make_dtmpc_problem(n_players = 2, N_win = 6, N_sim = 4)

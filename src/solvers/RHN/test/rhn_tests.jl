@@ -342,4 +342,66 @@ end
         @test length(take!(buf)) > 0
     end
 
+    # ── Test 15: _shift_trajectories produces a dynamics-consistent tail node ──
+    # Session correctness fix: the previous implementation repeated the OLD terminal
+    # STATE verbatim as the new terminal state, paired with the held (repeated) terminal
+    # control -- this does NOT satisfy x_new_{N+1} = f_d(x_new_N, u_new_N) in general
+    # (confirmed on a real receding-horizon window: chi(z_bar) dropped from 0.584 to
+    # 4.5e-6 after fixing just this one node). Verified here on the double-integrator
+    # fixture, whose dynamics are non-trivial (nonzero velocity means position keeps
+    # changing under a repeated control -- a naive state-repeat is NOT a fixed point).
+    # NOTE: `make_di_horizon_game` builds `LinearDynamics` (ONE joint state shared
+    # across players), which `_shift_trajectories` deliberately does NOT rewrite (see
+    # its docstring) -- a per-player Trajectory alone can't reconstruct a shared-state
+    # rollout without every other player's control too. The fix under test only applies
+    # to `SeparableDynamics` (the actual dynamics-spec type built by `PDGNEProblem`,
+    # which is what every production RHN/DTMPC caller in this repo uses), so this
+    # fixture builds a small `PDGNEProblem` directly instead of reusing
+    # `make_di_horizon_game`.
+    @testset "_shift_trajectories: dynamics-consistent tail (regression)" begin
+        dt = 0.1
+        N  = 10
+        A  = [1.0 dt; 0.0 1.0]
+        Bv = [0.0, dt]
+        disc_dyn(x, u, p, t) = A * x + Bv * u[1]   # discrete map, matches production PlayerSpec convention
+        zero_stage(x, u, pp, t) = 0.0
+        zero_terminal(x, pp) = 0.0
+        obj1 = PlayerObjective(1, NonlinearStageCost(zero_stage), NonlinearTerminalCost(zero_terminal))
+        obj2 = PlayerObjective(2, NonlinearStageCost(zero_stage), NonlinearTerminalCost(zero_terminal))
+        spec1 = PlayerSpec(1, 2, 1, [0.0, 1.0], disc_dyn, obj1)
+        spec2 = PlayerSpec(2, 2, 1, [0.0, 1.0], disc_dyn, obj2)
+        game = PDGNEProblem([spec1, spec2], N * dt, dt)
+        @test game.dynamics isa DifferentialGamesBase.SeparableDynamics
+
+        # A trajectory with genuine (non-fixed-point) motion: constant velocity, zero
+        # control, so position keeps advancing -- if the tail were a naive repeat of the
+        # old terminal state, it would NOT match a fresh rollout.
+        x0 = [0.0, 1.0]   # position 0, velocity 1
+        states = zeros(2, N+1)
+        states[:,1] = x0
+        for k in 1:N
+            states[:,k+1] = A * states[:,k]
+        end
+        controls1 = zeros(1, N)   # player 1: zero control throughout
+        controls2 = zeros(1, N)   # player 2: zero control throughout
+        traj1 = DifferentialGamesBase.Trajectory(1, states, controls1, collect(0.0:dt:(N*dt)), 0.0)
+        traj2 = DifferentialGamesBase.Trajectory(2, states, controls2, collect(0.0:dt:(N*dt)), 0.0)
+
+        shifted = DifferentialGamesBaseSolvers._shift_trajectories([traj1, traj2], game, dt)
+
+        for (i, tr) in enumerate(shifted)
+            @test size(tr.states, 2) == N + 1     # node count preserved
+            @test size(tr.controls, 2) == N        # node count preserved
+            # The new terminal state must equal a genuine dynamics rollout from the new
+            # terminal control, NOT a bare repeat of the old terminal state.
+            fᵢ = game.dynamics.player_dynamics[i]
+            x_expected = fᵢ(tr.states[:, N], tr.controls[:, N], nothing, (N-1)*dt)
+            @test tr.states[:, N+1] ≈ x_expected atol=1e-10
+            # For THIS non-fixed-point trajectory, the corrected tail must differ from the
+            # old (buggy) naive repeat of the pre-shift terminal state -- i.e. the fix
+            # actually changes behavior here, not a no-op.
+            @test !isapprox(tr.states[:, N+1], states[:, N+1]; atol=1e-6)
+        end
+    end
+
 end # @testset "Receding Horizon Nash solver"

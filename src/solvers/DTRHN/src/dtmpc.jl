@@ -225,6 +225,24 @@ so e.g. a jammer can carry 3 channels while a target carries 2).
 # Tightening (Eq. 4/5)
 - `tighten_actuator`, `actuator_max`       : `‖a*‖ + α·s ≤ a_max` (**nonconvex**:
   bilinear now that α is co-optimized — see the module header)
+- `tighten_actuator_convex::Bool` : when `true`, replaces the bilinear `‖a*‖+scale·α·s≤a_max`
+  tightening with the CONVEX conservative surrogate `‖a*‖+scale·(α²/c+c·s²)/2≤a_max`,
+  `c=ᾱ/s̄` taken from that window's own carried α/s (exact at the reference point, see
+  `build_tightened_actuator_constraint_convex`). Falls back to the bilinear form when no
+  carried α/s is yet available (e.g. the very first window). Defaults to `false`
+  (unchanged bilinear behavior for every existing caller) -- an opt-in numerics fix for
+  when the bilinear form shows AL/conditioning distress despite comfortable physical
+  headroom, not a physical relaxation.
+- `trans_input_scale` : per-agent UNIT-CONVERSION factor for the translational channel.
+  Both the tightening bound above and the runtime ancillary correction
+  (`lsh_boundary_layer_control`) are written for a 2nd-order system with the control
+  DIRECTLY equal to acceleration (`ẍ=u`, i.e. `B(x)=I`, mass=1). For a force-controlled
+  agent (`ẍ=u/m`, i.e. `B(x)=I/m`), the physically correct forms are
+  `‖F*‖ + m·α·s ≤ F_max` and `δF = -m·α·s·sat(·)` (the manuscript's `B(x)⁻¹` factor
+  becomes `m·I` here). Defaults to `1.0` for every agent, exactly reproducing the
+  original acceleration-control formulas byte-for-byte, so existing callers (e.g. an
+  acceleration-controlled game) are completely unaffected. A force-controlled game
+  passes `trans_input_scale=[m_1, m_2, ...]`.
 - `tighten_rot_actuator`, `rot_actuator_max` : `‖ω*‖ + α_r·s_r ≤ ω_max` (**nonconvex**, ditto)
 - `constraint_tightening`, `collision_min_distance`, `coupled_pairs` : collision
   margin `d_min − ‖r_i−r_j‖ + s_i + s_j ≤ 0` (nonconvex; Eq. 5 worked example)
@@ -260,6 +278,8 @@ struct DTMPCParameters{T}
     coupled_pairs::Vector{Tuple{Int, Int}}
     tighten_actuator::Bool
     actuator_max::Vector{T}
+    trans_input_scale::Vector{T}
+    tighten_actuator_convex::Bool
 
     ancillary::Symbol
     λ::Vector{T}
@@ -314,6 +334,8 @@ struct DTMPCParameters{T}
         coupled_pairs::Vector{Tuple{Int, Int}} = Tuple{Int, Int}[],
         tighten_actuator::Bool = false,
         actuator_max::Union{Nothing, Vector{T}} = nothing,
+        trans_input_scale::Union{Nothing, Vector{T}} = nothing,
+        tighten_actuator_convex::Bool = false,
         ancillary::Symbol = :none,
         λ::Union{Nothing, Vector{T}} = nothing,
         s_max::T = T(1e3),
@@ -356,6 +378,8 @@ struct DTMPCParameters{T}
         λ       = λ       !== nothing ? λ       : fill(T(0.1),  n_agents)
         actuator_max = actuator_max !== nothing ? actuator_max : fill(T(Inf), n_agents)
         @assert !tighten_actuator || all(isfinite, actuator_max) "tighten_actuator requires finite actuator_max"
+        trans_input_scale = trans_input_scale !== nothing ? trans_input_scale : fill(T(1.0), n_agents)
+        @assert all(trans_input_scale .> 0) "trans_input_scale must be > 0"
         @assert all(α_fixed .> 0) "α_fixed must be > 0 (tube ODE stable iff α>0)"
 
         rotational_tube = rotational_tube !== nothing ? rotational_tube : fill(false, n_agents)
@@ -377,7 +401,7 @@ struct DTMPCParameters{T}
         D_d       = D_d       !== nothing ? D_d       : fill(T(1e-3),n_agents)
         η_d       = η_d       !== nothing ? η_d       : fill(T(1e-4),n_agents)
 
-        for v in (s₀, α_fixed, D, η, κ_speed, λ, actuator_max,
+        for v in (s₀, α_fixed, D, η, κ_speed, λ, actuator_max, trans_input_scale,
                   s₀_r, α_fixed_r, D_r, η_r, rot_actuator_max, λ_r, rot_rate_max,
                   s₀_d, α_fixed_d, D_d, η_d)
             @assert length(v) == n_agents "all per-agent parameter vectors must have length n_agents"
@@ -406,7 +430,8 @@ struct DTMPCParameters{T}
 
         new{T}(s₀, α_fixed, D, η, κ_speed, pos_dim,
                constraint_tightening, collision_min_distance, coupled_pairs,
-               tighten_actuator, actuator_max, ancillary, λ, s_max,
+               tighten_actuator, actuator_max, trans_input_scale, tighten_actuator_convex,
+               ancillary, λ, s_max,
                α_lo, α_max, v_max,
                rotational_tube, s₀_r, α_fixed_r, D_r, η_r,
                rot_dim, rot_state_offset, rot_ctrl_offset,
@@ -733,7 +758,7 @@ of co-optimizing α; it is accepted, not overlooked. If AL convergence degrades 
 `α·s ≤ (α²/c + c·s²)/2` (exact at `c = α/s`), NOT reverting to a fixed α.
 """
 function build_tightened_actuator_constraint(i::Int, n_i::Int, nch::Int, chan_idx::Int,
-                                             pos_dim::Int, a_max; ε = 1e-9)
+                                             pos_dim::Int, a_max, scale = 1; ε = 1e-9)
     s_idx = n_i + chan_idx
     α_idx = n_i + nch + chan_idx
     func = function (x, u, p, t)
@@ -743,9 +768,47 @@ function build_tightened_actuator_constraint(i::Int, n_i::Int, nch::Int, chan_id
             a2 += u[k]^2
         end
         anorm = sqrt(a2 + T(ε)^2)
-        return [anorm + x[α_idx] * x[s_idx] - T(a_max)]
+        # `scale` converts the co-optimized bandwidth/width product (an ACCELERATION-
+        # authority reserve, `α·s`) into the control's own units -- 1.0 for an
+        # acceleration-controlled agent (B(x)=I), or the agent's mass for a force-
+        # controlled agent (B(x)=I/m, so B(x)⁻¹=m·I) -- see `trans_input_scale` docstring.
+        return [anorm + T(scale) * x[α_idx] * x[s_idx] - T(a_max)]
     end
     return PrivateInequality(i; func = func, dim = 1, is_convex = false)
+end
+
+"""
+    build_tightened_actuator_constraint_convex(i, n_i, nch, chan_idx, pos_dim, a_max, scale, c;
+        ε) -> PrivateInequality
+
+CONVEX conservative surrogate for the actuator tightening above, per that function's own
+docstring: `α·s ≤ (α²/c + c·s²)/2` for any fixed `c>0`, by AM-GM (equality iff `α/s=c`). The
+caller supplies `c` as the CURRENT/reference ratio `ᾱ/s̄` (e.g. this window's carried α/s),
+making the surrogate exact at that point while remaining a valid (conservative) bound
+elsewhere and, crucially, CONVEX in `(α,s)` for fixed `c` — unlike the bilinear `α·s` form,
+this can be marked `is_convex=true` and takes FALCON's hard, always-linearized, no-AL-
+penalty path. Intended for use when `tighten_actuator=true`'s bilinear form shows AL/
+conditioning distress (large `ΔJ_ζ`, degraded convergence) despite comfortable physical
+headroom (`r_total=(‖F*‖+scale·α·s)/a_max` well below 1) -- a numerics fix, not a physical
+relaxation: at `c=ᾱ/s̄` the two forms agree exactly, so this does not change what the
+constraint MEANS at the reference point, only how tightly FALCON can enforce it away from
+it.
+"""
+function build_tightened_actuator_constraint_convex(i::Int, n_i::Int, nch::Int, chan_idx::Int,
+                                                     pos_dim::Int, a_max, scale, c; ε = 1e-9)
+    s_idx = n_i + chan_idx
+    α_idx = n_i + nch + chan_idx
+    func = function (x, u, p, t)
+        T = promote_type(eltype(x), eltype(u))
+        a2 = zero(T)
+        @inbounds for k in 1:pos_dim
+            a2 += u[k]^2
+        end
+        anorm = sqrt(a2 + T(ε)^2)
+        surrogate = (x[α_idx]^2 / T(c) + T(c) * x[s_idx]^2) / 2
+        return [anorm + T(scale) * surrogate - T(a_max)]
+    end
+    return PrivateInequality(i; func = func, dim = 1, is_convex = true)
 end
 
 """
@@ -959,8 +1022,23 @@ function build_augmented_game(
         # Per-channel tightening (Corollary 2 actuator/rate authority, detection floor).
         for (k, c) in enumerate(chans)
             if c.kind === :translational && params.tighten_actuator
-                push!(priv_i, build_tightened_actuator_constraint(
-                    i, sdims[i], nch, k, params.pos_dim, params.actuator_max[i]))
+                # Convex surrogate (opt-in, default off): linearize the bilinear alpha*s
+                # reserve about this window's own carried alpha/s (c=carried_alphas/
+                # carried_widths, channel 1 = translational) -- exact at that point, convex
+                # everywhere. Falls back to the exact bilinear form when no carried α/s is
+                # yet available (e.g. the very first window).
+                use_convex = params.tighten_actuator_convex &&
+                             carried_widths !== nothing && carried_alphas !== nothing
+                if use_convex
+                    c_i = max(carried_alphas[i][1], T(1e-8)) / max(carried_widths[i][1], T(1e-8))
+                    push!(priv_i, build_tightened_actuator_constraint_convex(
+                        i, sdims[i], nch, k, params.pos_dim, params.actuator_max[i],
+                        params.trans_input_scale[i], c_i))
+                else
+                    push!(priv_i, build_tightened_actuator_constraint(
+                        i, sdims[i], nch, k, params.pos_dim, params.actuator_max[i],
+                        params.trans_input_scale[i]))
+                end
             elseif c.kind === :rotational
                 # Second-order channel: torque (control) tightening and rate (state)
                 # tightening are independent constraints — both may apply.
@@ -1022,20 +1100,24 @@ end
 # ============================================================================
 
 """
-    lsh_boundary_layer_control(ū_i, x_i, x̄_i, s_i, α_i, λ_i, pos_dim) -> u_total_i
+    lsh_boundary_layer_control(ū_i, x_i, x̄_i, s_i, α_i, λ_i, pos_dim; scale) -> u_total_i
 
 LSH boundary-layer sliding ancillary for a 2nd-order translational subsystem.
 `α_i` is the channel's CO-OPTIMIZED bandwidth at this step (manuscript Eq. 10) — the caller
 passes the carried closed-loop value (`ch_α[i][1][t]`), not a design constant:
-`K = α_i·s_i`. Sliding variable `s̃=ṽ+λr̃`; `sat(·)` clamped to `[−1,1]`.
+`K = scale·α_i·s_i`. Sliding variable `s̃=ṽ+λr̃`; `sat(·)` clamped to `[−1,1]`.
+`scale` is `trans_input_scale[i]` (default 1, i.e. acceleration control / B(x)=I) --
+the mass for a force-controlled agent (B(x)=I/m), converting the desired acceleration
+correction into a force correction (`δF=m·δa`), mirroring how the rotational ancillary
+scales by `J_r` to convert an angular-acceleration correction into torque.
 """
 function lsh_boundary_layer_control(
     ū_i::AbstractVector{T}, x_i::AbstractVector{T}, x̄_i::AbstractVector{T},
-    s_i::T, α_fixed_i::T, λ_i::T, pos_dim::Int; ε::T = T(1e-6),
+    s_i::T, α_fixed_i::T, λ_i::T, pos_dim::Int; ε::T = T(1e-6), scale::T = one(T),
 ) where {T}
     u = collect(ū_i)
     Φ = max(s_i, ε)
-    K = α_fixed_i * s_i
+    K = scale * α_fixed_i * s_i
     @inbounds for k in 1:pos_dim
         r̃ = x_i[k] - x̄_i[k]
         ṽ = x_i[pos_dim+k] - x̄_i[pos_dim+k]
@@ -1277,6 +1359,22 @@ clock, a peer position for a fixed-point constraint — WITHOUT decomposing the 
 repeated single-step `solve()` calls, which would lose warm-start propagation and force the
 tube widths to be hand-reseeded. See the call site for the full argument contract; it is
 observational only.
+
+`recovery_callback` (default `nothing`) fires ONLY when a window's primary solve AND the
+built-in fresh-warmstart retry have both failed, as
+
+    recovery_callback(; step, current_x, s_cur, carried_widths, carried_alphas, warmstart,
+                        aug_game, game) -> Union{Nothing, <:Any}
+
+handed the SAME `warmstart` this window actually entered with (never a failed attempt's own
+output) plus enough to rebuild an augmented game via [`build_augmented_game`](@ref) against a
+DIFFERENT `game`/`DTMPCParameters` if desired. Return `nothing` to defer to the existing
+clean-termination guard, or a solution object satisfying the same duck-typed interface as an
+inner solve (`.converged`, [`get_trajectory`](@ref)) — re-validated here with the same
+independent finiteness check applied to any primary solve, since a recovery callback is
+exactly as untrusted as the inner solver until proven otherwise. This package has NO opinion
+on what a recovery attempt should look like (a parameter-homotopy schedule, a relaxed
+formulation, ...) — that logic belongs entirely to the caller.
 """
 struct DynamicTubeMPC{S <: GameSolver} <: GameSolver
     inner_solver::S
@@ -1285,6 +1383,9 @@ struct DynamicTubeMPC{S <: GameSolver} <: GameSolver
     params::Union{Nothing, DTMPCParameters}
     discrete_dynamics::Bool
     step_callback::Union{Nothing, Function}
+    pre_solve_callback::Union{Nothing, Function}
+    recovery_callback::Union{Nothing, Function}
+    window_callback::Union{Nothing, Function}
 
     function DynamicTubeMPC(
         inner_solver::S;
@@ -1293,8 +1394,11 @@ struct DynamicTubeMPC{S <: GameSolver} <: GameSolver
         params::Union{Nothing, DTMPCParameters} = nothing,
         discrete_dynamics::Bool = true,
         step_callback::Union{Nothing, Function} = nothing,
+        pre_solve_callback::Union{Nothing, Function} = nothing,
+        recovery_callback::Union{Nothing, Function} = nothing,
+        window_callback::Union{Nothing, Function} = nothing,
     ) where {S <: GameSolver}
-        new{S}(inner_solver, warm_start, verbose_inner, params, discrete_dynamics, step_callback)
+        new{S}(inner_solver, warm_start, verbose_inner, params, discrete_dynamics, step_callback, pre_solve_callback, recovery_callback, window_callback)
     end
 end
 
@@ -1333,6 +1437,78 @@ function _rollout_discrete(dyn::SeparableDynamics, x::AbstractVector,
 end
 
 # ============================================================================
+# Warm-start tail correction (session correctness fix)
+# ============================================================================
+
+"""
+    _fix_dtmpc_warmstart_tail(ws, inner_sol, cdims, nt_vec, dt, α_lo, α_max) -> WarmstartData
+
+`_shift_warmstart` (rhn.jl `_shift_trajectories`) extends the warm-start tail by one node
+using the classical MPC hold-last-control convention: repeat the outgoing window's
+terminal control verbatim, then roll the dynamics forward one step. That convention is
+correct for PHYSICAL controls, but WRONG for the artificial per-channel bandwidth-rate
+control `v` that drives the co-optimized tube bandwidth (manuscript Eq. 10,
+`alpha_{k+1}=alpha_k+dt*v_k`): holding a nonzero `v` and re-extending the tail by one more
+node on EVERY receding-horizon step compounds `alpha_tail += dt*v_held` across many
+shifts, eventually driving the warm-start's OWN late nodes outside the hard box
+`alpha_lo<=alpha<=alpha_max` — directly confirmed via a per-node postmortem (window 43/44
+of a real solar-game run: warm-start alpha up to 6.8 against alpha_max=5.0) — even though
+the CONVERGED solution the warm start derives from already satisfies the box everywhere,
+by construction.
+
+Fix: for each agent's translational/rotational tube channels, zero the tail's artificial
+rate-control rows (`v_tail=0`, so `alpha_tail=alpha_last`, automatically feasible since the
+preceding converged `alpha_last` already is) BEFORE re-rolling the tail state through the
+SAME per-player augmented dynamics `_shift_trajectories` already uses — keeping the tube
+width `s` dynamically consistent with the corrected `alpha`/physical rows (`s` is NOT
+independently clipped or reset; it is whatever the augmented dynamics produce from the
+corrected control). Physical control rows are left untouched (still held, per the
+classical convention — only the LAST `nt_vec[i]` rows of each agent's control vector are
+the artificial rate controls).
+
+Also serves as a standing correctness check: asserts every returned trajectory's
+bandwidth-state rows lie in `[α_lo-ε, α_max+ε]` at every node — a DTMPC-generated warm
+start should never hand FALCON one of its own co-optimized states outside its own hard
+box. This is a permanent invariant, not a debug-only toggle: cheap (O(N) per window) and
+exactly the class of defect that motivated this fix.
+"""
+function _fix_dtmpc_warmstart_tail(ws::WarmstartData{T}, inner_sol, cdims::Vector{Int},
+                                    nt_vec::Vector{Int}, dt::T, α_lo::T, α_max::T;
+                                    ε::T = T(1e-6)) where {T}
+    ws.trajectories === nothing && return ws
+    dyn = inner_sol.game.dynamics
+    fixed_trajs = map(ws.trajectories) do tr
+        N = size(tr.controls, 2)
+        i = findfirst(obj -> obj.player_id == tr.player_id, inner_sol.game.objectives)
+        nch = nt_vec[i]; cd = cdims[i]
+        if N > 1 && nch > 0
+            u_tail = copy(tr.controls[:, N])
+            u_tail[cd+1:cd+nch] .= zero(T)   # v_tail = 0 -> alpha_tail = alpha_last
+            new_controls = hcat(tr.controls[:, 1:N-1], u_tail)
+            if dyn isa SeparableDynamics
+                fᵢ = dyn.player_dynamics[i]
+                x_last = tr.states[:, N]   # the (already correctly shifted) pre-tail node
+                x_tail = fᵢ(x_last, u_tail, nothing, (N - 1) * dt)
+                new_states = hcat(tr.states[:, 1:N], x_tail)
+            else
+                new_states = tr.states
+            end
+            tr = Trajectory{T}(tr.player_id, new_states, new_controls, copy(tr.times), tr.cost)
+        end
+        n_i = size(tr.states, 1) - 2 * nch   # physical state dim for this agent
+        for k in 1:nch
+            α_row = n_i + nch + k
+            α_vals = @view tr.states[α_row, :]
+            @assert all(v -> α_lo - ε <= v <= α_max + ε, α_vals) "DTMPC warm-start tail fix: " *
+                "player $(tr.player_id) channel $k alpha out of box [$(α_lo),$(α_max)]: " *
+                "$(extrema(α_vals))"
+        end
+        tr
+    end
+    return WarmstartData{T}(fixed_trajs, ws.strategy, ws.dual_variables, ws.solver_specific)
+end
+
+# ============================================================================
 # Main receding-horizon loop
 # ============================================================================
 
@@ -1363,6 +1539,14 @@ function _solve_dtmpc(
     X = Matrix{T}(undef, n, N_sim + 1)
     X[:, 1] = prob.x0
     U_players = [Matrix{T}(undef, cdims[i], N_sim) for i in 1:np]
+
+    # Separately-tracked TRULY-APPLIED control (nominal ū_i plus the ancillary
+    # boundary-layer correction κ_i, when `ancillary=:lsh_boundary_layer`; identical
+    # to `U_players` otherwise). `U_players` intentionally stores the NOMINAL
+    # (pre-ancillary) control ū_i — matching the cost accounting below, which is
+    # evaluated on the planned trajectory, not the realized one — so this is a
+    # separate array rather than a change to `U_players`'s existing meaning.
+    U_applied = [Matrix{T}(undef, cdims[i], N_sim) for i in 1:np]
 
     # Separately-tracked NOMINAL joint state, used as the WARM-START SEED for
     # each window's (free) initial nominal — NOT a hard pin (§4). With
@@ -1415,6 +1599,23 @@ function _solve_dtmpc(
                                         carried_widths = carried,
                                         carried_alphas = carried_α)
 
+        # ── Pre-solve diagnostic hook ────────────────────────────────────────────────────
+        # Fires immediately BEFORE the inner solve, with the exact object about to be
+        # handed to it: the augmented game, the TRUE warm start being used this window
+        # (already shifted from the previous window's own converged solution when
+        # warm_start=true -- NOT reconstructable from any saved post-hoc trajectory), the
+        # measured state, and the carried tube widths/bandwidths. Exists so a caller can
+        # inspect a specific window's actual input (e.g. compute chi_seed via
+        # _compute_infeasibility on the real warm start, not an approximation) without
+        # needing to re-derive it. Purely observational, mirrors step_callback's contract.
+        if solver.pre_solve_callback !== nothing
+            solver.pre_solve_callback(;
+                step = t, current_x = current_x, s_cur = s_cur,
+                carried_widths = carried, carried_alphas = carried_α,
+                warmstart = warmstart, aug_game = aug_game,
+            )
+        end
+
         t0 = time()
         inner_sol = solve(aug_game, solver.inner_solver;
                           warmstart = warmstart, verbose = solver.verbose_inner,
@@ -1440,6 +1641,28 @@ function _solve_dtmpc(
                               check_compatibility = false)
             ok = inner_sol.converged && _finite_sol(inner_sol)
         end
+        # ── Recovery hook (session extension, generic — DTMPC stays ignorant of WHY a caller
+        # can recover a failed window): fires ONLY after both the primary solve and the fresh-
+        # warmstart retry above have failed. Handed the SAME `warmstart` this window actually
+        # entered with (the last-known-good shifted warm start — never the failed attempt's own
+        # output) plus the augmented game and measured/tube state, so a caller can retry with
+        # e.g. a parameter-homotopy wrapper (a terminal-cost continuation schedule, a relaxed
+        # formulation, etc.) built entirely OUTSIDE this package. Must return either `nothing`
+        # (defer to the existing clean-termination guard below) or an object satisfying the
+        # SAME duck-typed interface as `inner_sol` (`.converged`, `get_trajectory(sol, i)`) —
+        # re-checked here with the SAME independent finiteness test, since a recovery callback
+        # is exactly as untrusted as the primary solver until proven otherwise. ────────────────
+        if !ok && solver.recovery_callback !== nothing
+            recovered = solver.recovery_callback(;
+                step = t, current_x = current_x, s_cur = s_cur,
+                carried_widths = carried, carried_alphas = carried_α,
+                warmstart = warmstart, aug_game = aug_game, game = game,
+            )
+            if recovered !== nothing && recovered.converged && _finite_sol(recovered)
+                inner_sol = recovered
+                ok = true
+            end
+        end
         if !ok
             all_converged = false
             terminated_early = true
@@ -1453,8 +1676,10 @@ function _solve_dtmpc(
 
         joint_states = _joint_augmented_state(inner_sol, np)
         u_total_agents = Vector{Vector{T}}(undef, np)
+        window_controls_local = Vector{Matrix{T}}(undef, np)   # session addition, see window_callback below
         for i in 1:np
             traj = get_trajectory(inner_sol, i)
+            window_controls_local[i] = traj.controls[1:cdims[i], :]
             ū_i = traj.controls[1:cdims[i], 1]
             x_i = agent_physical_block(current_x, sdims, i)
             nch = nt_vec[i]; chans = chans_all[i]
@@ -1470,7 +1695,8 @@ function _solve_dtmpc(
                 # Ancillary gain K=α·s now uses the CARRIED closed-loop α (co-optimized),
                 # not the channel's fixed design constant.
                 u_tmp = lsh_boundary_layer_control(ū_i, x_i, x̄_i, ch_s[i][1][t],
-                                                   ch_α[i][1][t], params.λ[i], params.pos_dim)
+                                                   ch_α[i][1][t], params.λ[i], params.pos_dim;
+                                                   scale = params.trans_input_scale[i])
                 if nch ≥ 2 && chans[2].kind === :rotational
                     u_tmp = lsh_rotational_boundary_layer_control(
                         u_tmp, x_i, x̄_i, ch_s[i][2][t], ch_α[i][2][t], params.λ_r[i], params.J_rot[i],
@@ -1482,6 +1708,7 @@ function _solve_dtmpc(
             end
 
             U_players[i][:, t] = ū_i
+            U_applied[i][:, t] = u_total_agents[i]
             obj = get_objective(game, i)
             total_costs[i] += obj.scaling * evaluate_stage_cost(obj.stage_cost, x_i, ū_i, nothing, t)
         end
@@ -1557,6 +1784,48 @@ function _solve_dtmpc(
             )
         end
 
+        # ── Per-window FULL-prediction callback hook (session addition, SEPARATE from
+        # step_callback so no existing caller's fixed-keyword-list callback function can
+        # break — several jamming-game scripts define `step_callback`/`on_step` WITHOUT a
+        # catch-all `kwargs...`, so adding a new kwarg to THAT invocation would have been a
+        # real regression). Fires with this window's OWN just-solved FULL trajectory, per
+        # agent, physical rows only (`n_x_i × (N_win+1)`, local node 1 = the measurement this
+        # window solved from, local node j = x*_{t+j-1|t}) — sliced directly from
+        # `joint_states` (already computed above for the node-1/node-2 bookkeeping; no
+        # duplicate solve). Exists because callers previously had no way to inspect a
+        # window's own PREDICTED trajectory beyond one step ahead (`:nominal_X` only ever
+        # stitches node 2 of each window) — needed to answer "does THIS window's own
+        # prediction still contain a future event the stitched one-step-ahead view can't
+        # show" (e.g. a delayed reacquisition maneuver) without any additional solve.
+        # `window_controls` (session addition): this window's OWN just-solved FULL control
+        # sequence, per agent, physical rows only (`n_u_i × N_win`) -- captured from
+        # `get_trajectory(inner_sol,i).controls` during the per-agent loop above (no
+        # duplicate solve). Needed to compare what an EARLIER window planned to apply at a
+        # LATER local node against what a subsequent window actually re-optimized and
+        # applied at that same absolute step (Δu_k = u*_{k|k} - u*_{k|k'} for k'<k).
+        #
+        # `window_aug_node1` (session addition): this window's OWN converged AUGMENTED
+        # (tube-width `s` + bandwidth `alpha`) node-1 values, per agent, in that order
+        # (`s_chan1,...,s_chanNch,alpha_chan1,...,alpha_chanNch`) — i.e. Phi_{i,t|t} and
+        # alpha_{i,t|t}, the window's own FREE initial-containment decision (per
+        # `dtmpc_free_initial_mask`, EVERY augmented initial-state component is free, not
+        # hard-pinned; only `build_initial_containment_constraint` ties it to the
+        # measurement). Neither `window_states` (physical rows only) nor `step_callback`'s
+        # `s`/`alpha` (both anchored to node 2, i.e. gamma_{t+1|t}/alpha_{t+1|t} — see that
+        # callback's own call site) expose this node-1 quantity; needed to test the
+        # INITIAL-containment constraint's own geometry directly, separately from the
+        # already-exposed one-step-ahead prediction.
+        #
+        # Purely observational by contract, same as `step_callback`.
+        if solver.window_callback !== nothing
+            window_states = [joint_states[aug_offsets[i]+1 : aug_offsets[i]+sdims[i], :] for i in 1:np]
+            window_aug_node1 = [joint_states[aug_offsets[i]+sdims[i]+1 : aug_offsets[i]+sdims[i]+2*nt_vec[i], 1] for i in 1:np]
+            solver.window_callback(; step = t, window_states = window_states,
+                                     window_controls = window_controls_local,
+                                     window_aug_node1 = window_aug_node1,
+                                     converged = inner_sol.converged)
+        end
+
         # Only propagate the shifted warm start when the inner solve actually CONVERGED.
         # A non-converged `inner_sol` is, by definition, not a trusted trajectory — feeding
         # it forward as the next window's starting point can compound rather than recover
@@ -1567,7 +1836,13 @@ function _solve_dtmpc(
         # the newly MEASURED state) each time a window fails, giving the next window a
         # clean, well-defined starting point instead of inheriting whatever the failed SCP
         # run left behind.
-        warmstart = (solver.warm_start && inner_sol.converged) ? _shift_warmstart(inner_sol) : nothing
+        if solver.warm_start && inner_sol.converged
+            warmstart = _fix_dtmpc_warmstart_tail(_shift_warmstart(inner_sol), inner_sol,
+                                                   cdims, nt_vec, T(game.time_horizon.dt),
+                                                   params.α_lo, params.α_max)
+        else
+            warmstart = nothing
+        end
     end
 
     # ── Clean truncation on early termination (failure-path guard above) ───────────────────
@@ -1580,6 +1855,7 @@ function _solve_dtmpc(
         X  = X[:, 1:N_sim+1]
         X̄  = X̄[:, 1:N_sim+1]
         U_players = [U_players[i][:, 1:N_sim] for i in 1:np]
+        U_applied = [U_applied[i][:, 1:N_sim] for i in 1:np]
         ch_s = [[ch_s[i][k][1:N_sim+1] for k in 1:nt_vec[i]] for i in 1:np]
         ch_α = [[ch_α[i][k][1:N_sim+1] for k in 1:nt_vec[i]] for i in 1:np]
         s_traj = [ch_s[i][1] for i in 1:np]
@@ -1616,6 +1892,7 @@ function _solve_dtmpc(
             :all_coupled_constraints_satisfied => isempty(coupled_violations),
             :nominal_X => X̄,
             :nominal_mode => nominal_mode,
+            :applied_U => U_applied,
             :rotational_tube => copy(params.rotational_tube),
             :detection_tube => copy(params.detection_tube),
             :s_r_trajectories => s_r_traj,
