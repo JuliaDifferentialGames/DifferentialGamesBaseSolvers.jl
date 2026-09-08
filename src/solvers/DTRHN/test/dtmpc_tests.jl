@@ -28,6 +28,7 @@ using FALCON
 using DifferentialGamesBaseSolvers:
     build_augmented_player_dynamics_discrete, build_augmented_cost,
     build_tightened_collision_constraint, build_tightened_actuator_constraint,
+    build_tightened_rot_actuator_constraint,
     build_initial_containment_constraint, build_augmented_game,
     agent_physical_block, block_offsets, augmented_state_dims,
     augmented_control_dims, extract_agent_augmented, tube_channels,
@@ -238,6 +239,31 @@ end
         val2 = evaluate_constraint(c, T[0.0,0.0,0.1,4.0], T[0.3], (player=1,timestep=0), 0.0)[1]
         @test val2 ≈ 0.3 + 4.0*0.1 - 1.0 atol=1e-6
         @test val2 > val
+    end
+
+    # ── A6b: tightened ROTATIONAL actuator (torque) constraint, J-scaled ────
+    # Session correctness fix: this tightening previously omitted the inertia factor
+    # entirely (dimensionally inconsistent with the runtime ancillary's own J-scaled
+    # rotational correction). Regression-guards the Euclidean-norm reserve
+    # ‖J‖₂·α_r·s_r introduced to fix that.
+    @testset "A6b tightened rotational actuator constraint (J-scaled)" begin
+        T = Float64
+        # (i, n_i, nch, chan_idx, rot_ctrl_offset, rot_dim, τ_max, Jdiag);
+        # s_idx=n_i+chan_idx=3, α_idx=n_i+nch+chan_idx=4, torque read from u[1:3].
+        # J=[1,1,1] ⇒ ‖J‖₂=√3 exactly (isotropic-inertia reduction).
+        c_iso = build_tightened_rot_actuator_constraint(1, 2, 1, 1, 0, 3, T(1.0), T[1.0, 1.0, 1.0])
+        @test !is_convex(c_iso)
+        x = T[0.0, 0.0, 0.1, 2.0]; u = T[0.3, 0.0, 0.0]
+        val_iso = evaluate_constraint(c_iso, x, u, (player=1,timestep=0), 0.0)[1]
+        @test val_iso ≈ 0.3 + sqrt(3.0)*2.0*0.1 - 1.0 atol=1e-6
+        # Single-axis inertia (J=[J1,0,0]) ⇒ ‖J‖₂=J1 exactly, matching the scalar
+        # single-axis reserve J1·α·s directly.
+        c_single = build_tightened_rot_actuator_constraint(1, 2, 1, 1, 0, 3, T(1.0), T[5.0, 0.0, 0.0])
+        val_single = evaluate_constraint(c_single, x, u, (player=1,timestep=0), 0.0)[1]
+        @test val_single ≈ 0.3 + 5.0*2.0*0.1 - 1.0 atol=1e-6
+        # Jdiag=[1,1,1] is NOT the same reserve as an un-scaled (old, buggy) constraint
+        # once J is non-trivial -- sanity-check the two isolated cases actually differ.
+        @test val_single != val_iso
     end
 
     # ── A7: initial-containment constraint (§4) ─────────────────────────────

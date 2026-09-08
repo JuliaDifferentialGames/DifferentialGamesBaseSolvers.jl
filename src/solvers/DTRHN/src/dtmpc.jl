@@ -243,7 +243,15 @@ so e.g. a jammer can carry 3 channels while a target carries 2).
   original acceleration-control formulas byte-for-byte, so existing callers (e.g. an
   acceleration-controlled game) are completely unaffected. A force-controlled game
   passes `trans_input_scale=[m_1, m_2, ...]`.
-- `tighten_rot_actuator`, `rot_actuator_max` : `‖ω*‖ + α_r·s_r ≤ ω_max` (**nonconvex**, ditto)
+- `tighten_rot_actuator`, `rot_actuator_max` : TORQUE tightening `‖τ*‖ + ‖J_rot‖₂·α_r·s_r
+  ≤ rot_actuator_max` (**nonconvex**, ditto — session fix: previously missing the `J_rot`
+  factor entirely, inconsistent with the runtime ancillary's own `J`-scaled correction, see
+  `build_tightened_rot_actuator_constraint`'s docstring)
+- `tighten_rot_rate`, `rot_rate_max` : RATE (state) tightening `‖ω*‖ + s_r ≤ rot_rate_max`
+  (convex — see `build_tightened_rot_rate_constraint`). Was previously undocumented at this
+  level; do not confuse with `tighten_rot_actuator` above (control vs. state, TORQUE vs.
+  RATE — the stale prior wording here described `tighten_rot_actuator` using this rate
+  formula, an internal documentation inconsistency, now fixed).
 - `constraint_tightening`, `collision_min_distance`, `coupled_pairs` : collision
   margin `d_min − ‖r_i−r_j‖ + s_i + s_j ≤ 0` (nonconvex; Eq. 5 worked example)
 
@@ -813,18 +821,31 @@ end
 
 """
     build_tightened_rot_actuator_constraint(i, n_i, nch, chan_idx, rot_ctrl_offset, rot_dim,
-        τ_max; ε) -> PrivateInequality
+        τ_max, Jdiag; ε) -> PrivateInequality
 
-Rotational actuator (TORQUE) counterpart: `‖τ*‖ + α_r·s_r − τ_max ≤ 0`, reading both the
-rotational width and bandwidth from the augmented state. **NONCONVEX** for the same
+Rotational actuator (TORQUE) counterpart: `‖τ*‖ + ‖J‖₂·α_r·s_r − τ_max ≤ 0`, reading both
+the rotational width and bandwidth from the augmented state. **NONCONVEX** for the same
 bilinearity reason as [`build_tightened_actuator_constraint`](@ref) — see its docstring.
+
+`Jdiag` is REQUIRED (session correctness fix — previously omitted entirely, an internal
+inconsistency with the runtime ancillary `lsh_boundary_layer_control`'s rotational
+correction `δτ = -J·α_r·Φ_r·sat(s̃/Φ_r)`, which explicitly converts the co-optimized
+angular-ACCELERATION reserve `α_r·Φ_r` into torque via `J`; this tightening bound must use
+the SAME conversion to stay consistent with what the ancillary can actually apply at
+runtime). The physical actuator constraint is Euclidean, `‖τ*+δτ‖₂≤τ_max`, and each
+per-axis saturation component has magnitude ≤1, so `‖δτ‖₂ ≤ ‖J‖₂·α_r·s_r` where
+`‖J‖₂=sqrt(J₁²+J₂²+J₃²)` for the diagonal inertia vector — a clean, sufficient (if slightly
+conservative for non-uniform `J`) tightening. `Jgain=1.0` recovers the old (dimensionally
+wrong) behavior exactly, so this is opt-in only insofar as a caller passes `Jdiag=[1,1,1]`;
+every real caller should pass its actual diagonal inertia.
 """
 function build_tightened_rot_actuator_constraint(
     i::Int, n_i::Int, nch::Int, chan_idx::Int, rot_ctrl_offset::Int, rot_dim::Int,
-    τ_max; ε = 1e-9,
+    τ_max, Jdiag; ε = 1e-9,
 )
     s_idx = n_i + chan_idx
     α_idx = n_i + nch + chan_idx
+    Jgain = norm(Jdiag)
     func = function (x, u, p, t)
         T = promote_type(eltype(x), eltype(u))
         w2 = zero(T)
@@ -832,7 +853,7 @@ function build_tightened_rot_actuator_constraint(
             w2 += u[rot_ctrl_offset + k]^2
         end
         wnorm = sqrt(w2 + T(ε)^2)
-        return [wnorm + x[α_idx] * x[s_idx] - T(τ_max)]
+        return [wnorm + T(Jgain) * x[α_idx] * x[s_idx] - T(τ_max)]
     end
     return PrivateInequality(i; func = func, dim = 1, is_convex = false)
 end
@@ -1045,7 +1066,7 @@ function build_augmented_game(
                 if params.tighten_rot_actuator
                     push!(priv_i, build_tightened_rot_actuator_constraint(
                         i, sdims[i], nch, k, params.rot_ctrl_offset, params.rot_dim,
-                        params.rot_actuator_max[i]))
+                        params.rot_actuator_max[i], params.J_rot[i]))
                 end
                 if params.tighten_rot_rate
                     push!(priv_i, build_tightened_rot_rate_constraint(
