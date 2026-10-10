@@ -21,6 +21,9 @@ import DifferentialGamesBase:
 # LQ Games
 include("solvers/FNELQ/src/fnelq.jl")
 
+# Stochastic LQ Games (additive noise; certainty-equivalent to FNELQ)
+include("solvers/SFNELQ/src/sfnelq.jl")
+
 # iLQGames
 include("solvers/iLQGames/src/ilqgames.jl")
 
@@ -96,6 +99,8 @@ end
 # ============================================================================
 
 export FNELQ
+export SFNELQ
+export additive_noise_cost
 export iLQGames
 export ALGAMES
 export LIBR

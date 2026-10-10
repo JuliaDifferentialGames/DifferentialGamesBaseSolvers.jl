@@ -28,6 +28,25 @@ K_gains = sol.solver_info[:feedback_gains]   # per-player gain matrices
 
 **Requirements:** `LQGameProblem` or `LTVLQGameProblem`
 
+### SFNELQ — Stochastic Feedback Nash Equilibrium for LQ Games
+
+Feedback Nash equilibrium for discrete-time LQ games with additive Gaussian process
+noise. Delegates gain computation to `FNELQ` under certainty equivalence and reports the
+expected cost correction attributable to the noise.
+
+```julia
+sgame = StochasticGameProblem(game, ProcessNoiseModel(Σ))
+sol   = solve(sgame, SFNELQ())
+sol.solver_info[:noise_cost]  # per-player expected cost from noise
+```
+
+**Requirements:** `StochasticGameProblem` wrapping an `LQGameProblem`/`LTVLQGameProblem`,
+with additive (certainty-equivalent) noise only — see
+[`src/solvers/SFNELQ/SFNELQ.md`](https://github.com/JuliaDifferentialGames/DifferentialGamesBaseSolvers.jl/blob/main/src/solvers/SFNELQ/SFNELQ.md)
+for the full scope note.
+
+**Reference:** Başar & Olsder, *Dynamic Noncooperative Game Theory* (2nd ed., SIAM 1999), Ch. 6.
+
 ### iLQGames — Iterative Linear-Quadratic Games
 
 Approximate feedback Nash equilibria for nonlinear games by iterating:
@@ -72,6 +91,8 @@ gif(anim, "game.gif"; fps=20)
 
 ```@docs
 FNELQ
+SFNELQ
+additive_noise_cost
 iLQGames
 ALGAMES
 animate_solution

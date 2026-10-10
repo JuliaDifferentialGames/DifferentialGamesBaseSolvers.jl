@@ -1,8 +1,11 @@
+using DifferentialGamesBase
 using DifferentialGamesBaseSolvers
 using Test
 
 @testset "DifferentialGamesBaseSolvers.jl" begin
+    include("capability_vocabulary_test.jl")
     include("../src/solvers/FNELQ/test/fnelq_tests.jl")
+    include("../src/solvers/SFNELQ/test/sfnelq_tests.jl")
     include("../src/solvers/iLQGames/test/ilqgames_tests.jl")
     include("../src/solvers/ALGAMES/test/test_algames.jl")
     include("../src/solvers/LIBR/test/libr_tests.jl")
