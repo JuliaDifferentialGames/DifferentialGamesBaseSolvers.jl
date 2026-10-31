@@ -4,6 +4,8 @@ using LinearAlgebra
 using DifferentialGamesBase
 using ForwardDiff
 using Printf
+using Random
+using SparseArrays
 
 # Import everything needed for method extension and type use.
 # GameSolver and solve are defined in DGB/solve.jl — import to extend.
@@ -23,6 +25,9 @@ include("solvers/FNELQ/src/fnelq.jl")
 
 # Stochastic LQ Games (additive noise; certainty-equivalent to FNELQ)
 include("solvers/SFNELQ/src/sfnelq.jl")
+
+# Chance-constrained iterative LQ stochastic games (Zhong et al., RA-L 2023)
+include("solvers/CCiLQGames/src/ccilqgames.jl")
 
 # iLQGames
 include("solvers/iLQGames/src/ilqgames.jl")
@@ -141,6 +146,7 @@ end
 
 export FNELQ
 export SFNELQ
+export CCiLQGames
 export additive_noise_cost
 export gaussian_trajectory_moments
 export get_covariance_trajectory, get_expected_costs, get_mean_trajectory

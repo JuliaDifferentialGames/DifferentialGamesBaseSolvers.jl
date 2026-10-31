@@ -8,6 +8,7 @@ using Test
     include("../src/solvers/FNELQ/test/fnelq_tests.jl")
     include("../src/solvers/FNELQ/test/joint_lq_tests.jl")
     include("../src/solvers/SFNELQ/test/sfnelq_tests.jl")
+    include("../src/solvers/CCiLQGames/test/ccilqgames_tests.jl")
     include("../src/solvers/iLQGames/test/ilqgames_tests.jl")
     include("../src/solvers/ALGAMES/test/test_algames.jl")
     include("../src/solvers/DGSQP/test/dgsqp_tests.jl")

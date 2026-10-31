@@ -78,6 +78,8 @@ _stage_cost_value(sc::JointLQStageCost, i, ranges, x, u_joint, k) =
     evaluate_stage_cost(sc, x, u_joint, nothing, k)
 _stage_cost_value(sc::LQStageCost, i, ranges, x, u_joint, k) =
     evaluate_stage_cost(sc, x, u_joint[ranges[i]], nothing, k)
+_stage_cost_value(sc::AbstractStageCost, i, ranges, x, u_joint, k) =
+    evaluate_stage_cost(sc, x, u_joint[ranges[i]], nothing, k)
 
 # Result returned when a stage's stacked Nash system cannot be solved: zero
 # policies, `converged = false`, and an explicit status instead of a false equilibrium.
