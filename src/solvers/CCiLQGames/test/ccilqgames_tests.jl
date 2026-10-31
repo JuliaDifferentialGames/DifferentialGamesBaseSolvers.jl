@@ -157,3 +157,9 @@ end
         @test solver_capabilities(CCiLQGames) ⊆ DifferentialGamesBase.CANONICAL_CAPABILITIES
     end
 end
+
+@testset "Stochastic solver docstrings" begin
+    names = [:CCiLQGames, :SFNELQ, :additive_noise_cost, :gaussian_trajectory_moments,
+             :shared_observation_moments, :expected_costs_from_moments]
+    @test isempty([n for n in names if !Base.Docs.hasdoc(DifferentialGamesBaseSolvers, n)])
+end
