@@ -79,6 +79,23 @@ _stage_cost_value(sc::JointLQStageCost, i, ranges, x, u_joint, k) =
 _stage_cost_value(sc::LQStageCost, i, ranges, x, u_joint, k) =
     evaluate_stage_cost(sc, x, u_joint[ranges[i]], nothing, k)
 
+# Result returned when a stage's stacked Nash system cannot be solved: zero
+# policies, `converged = false`, and an explicit status instead of a false equilibrium.
+function _failed_fnelq_solution(game::GameProblem{T}, solver, status, k, t_vec, control_dims, elapsed) where {T}
+    np = game.n_players; n = length(game.initial_state); N = length(t_vec) - 1
+    x_traj = repeat(game.initial_state, 1, N + 1)
+    u_trajs = [zeros(T, control_dims[i], N) for i in 1:np]
+    gains = [[zeros(T, control_dims[i], n) for _ in 1:N] for i in 1:np]
+    ff = [[zeros(T, control_dims[i]) for _ in 1:N] for i in 1:np]
+    strategy = FeedbackStrategy(gains, ff, x_traj, [zeros(T, control_dims[i], N) for i in 1:np], control_dims, t_vec)
+    trajs = [Trajectory(i, x_traj, u_trajs[i], t_vec, T(NaN)) for i in 1:np]
+    @warn "FNELQ: stage Nash system is singular; no equilibrium computed" k
+    return GNEPSolution(game, trajs; state_trajectory = x_traj, strategy = strategy,
+        equilibrium_type = :FeedbackNash, converged = false, iterations = 1, solve_time = elapsed,
+        solver_info = Dict{Symbol, Any}(:status => status, :failed_at_step => k,
+            :rcond_history => Float64[], :min_rcond => 0.0))
+end
+
 function _solve(
     game::GameProblem{T},
     solver::FNELQ,
@@ -153,8 +170,17 @@ function _solve(
             end
         end
 
-        P_full = S \ YP
-        α_full = S \ Yα
+        local P_full, α_full
+        try
+            P_full = S \ YP
+            α_full = S \ Yα
+        catch err
+            err isa LinearAlgebra.SingularException || rethrow()
+            return _failed_fnelq_solution(game, solver, :singular_nash_system, k, t_vec, control_dims, time() - t_start)
+        end
+        if !all(isfinite, P_full) || !all(isfinite, α_full)
+            return _failed_fnelq_solution(game, solver, :singular_nash_system, k, t_vec, control_dims, time() - t_start)
+        end
         β_affine = -Bk * α_full
         Pk = [P_full[control_ranges[i], :] for i in 1:np]
         αk = [α_full[control_ranges[i]] for i in 1:np]
@@ -228,12 +254,17 @@ function _solve(
     trajectories = [Trajectory(i, x_traj, u_trajs[i], t_vec, costs[i]) for i in 1:np]
 
     total_time = time() - t_start
-    converged  = !(solver.check_singularity &&
-                   !isempty(rcond_hist) &&
-                   any(rcond_hist .< solver.rcond_threshold))
+    ill_conditioned = solver.check_singularity && !isempty(rcond_hist) &&
+                      any(rcond_hist .< solver.rcond_threshold)
+    non_nash = !(min_own_eig > 0)
+    status = ill_conditioned ? :ill_conditioned_nash_system :
+             non_nash        ? :second_order_violation : :solved
+    converged = status === :solved
 
-    if !converged
+    if ill_conditioned
         @warn "FNELQ: solution may be unreliable (S ill-conditioned)" min_rcond threshold=solver.rcond_threshold
+    elseif non_nash
+        @warn "FNELQ: a player's own-control Hessian block is not positive definite; the stationary point is not a Nash equilibrium" min_own_eig
     end
 
     return GNEPSolution(
@@ -249,6 +280,7 @@ function _solve(
             :cost_to_go_matrices  => Z_history,
             :rcond_history        => rcond_hist,
             :min_rcond            => min_rcond,
+            :status               => status,
             :min_own_hessian_eig  => min_own_eig,
             :second_order_ok      => min_own_eig > 0,
             :max_Z_norm           => max_Z_norm,

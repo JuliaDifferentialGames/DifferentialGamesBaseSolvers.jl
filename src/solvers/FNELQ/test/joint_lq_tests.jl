@@ -116,3 +116,34 @@ end
     @test sol.solver_info[:control_covariances][1] ≈ P[1] * Σ0 * P[1]'
     @test sol.solver_info[:state_control_covariances][1] ≈ -Σ0 * P[1]'
 end
+
+@testset "FNELQ/SFNELQ: failure statuses instead of false equilibria" begin
+    one(x) = reshape([float(x)], 1, 1)
+    mk(R1, R2) = JointLQGameProblem(one(1), [one(1), one(1)], [one(1), one(1)], [R1, R2],
+                                    [one(0), one(0)], [1.0], 3.0; dt = 1.0)
+
+    @testset "singular stacked Nash system" begin
+        g = mk([1.0 1.0; 1.0 1.0], [1.0 1.0; 1.0 1.0])
+        sol = @test_logs (:warn,) match_mode = :any solve(g, FNELQ())
+        @test !sol.converged
+        @test sol.solver_info[:status] === :singular_nash_system
+        sg = StochasticGameProblem(g, ProcessNoiseModel(one(0.1)))
+        ssol = @test_logs (:warn,) match_mode = :any solve(sg, SFNELQ())
+        @test !ssol.converged
+        @test ssol.solver_info[:status] === :singular_nash_system
+    end
+
+    @testset "non-convex own-control block is not reported as Nash" begin
+        g = mk([-1.0 0.0; 0.0 1.0], [1.0 0.0; 0.0 1.0])
+        sol = @test_logs (:warn,) match_mode = :any solve(g, FNELQ())
+        @test !sol.converged
+        @test sol.solver_info[:status] === :second_order_violation
+        @test sol.solver_info[:min_own_hessian_eig] < 0
+    end
+
+    @testset "well-posed game reports :solved" begin
+        g = mk([1.0 0.2; 0.2 1.0], [1.0 -0.1; -0.1 1.0])
+        sol = solve(g, FNELQ())
+        @test sol.converged && sol.solver_info[:status] === :solved
+    end
+end

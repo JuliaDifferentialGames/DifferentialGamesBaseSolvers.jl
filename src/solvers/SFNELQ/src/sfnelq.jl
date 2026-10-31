@@ -134,6 +134,10 @@ function _solve(
         rcond_threshold = solver.rcond_threshold,
         regularization = solver.regularization), warmstart, verbose)
 
+    if !haskey(det_sol.solver_info, :cost_to_go_matrices)
+        # FNELQ could not solve a stage game: propagate its failure status unchanged.
+        return det_sol
+    end
     Z_history = det_sol.solver_info[:cost_to_go_matrices]
     noise_cost = additive_noise_cost(sgame, Z_history)
 
