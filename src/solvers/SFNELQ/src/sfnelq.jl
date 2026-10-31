@@ -113,6 +113,55 @@ function gaussian_trajectory_moments(sgame::StochasticGameProblem{T}, strategy) 
     return (state_covariances = Σs, control_covariances = Σu, state_control_covariances = Σxu)
 end
 
+"""
+    shared_observation_moments(sgame, strategy) -> NamedTuple
+
+Moments of the physical state, the common estimate, and the joint control for
+`u_k = -P_k x̂_k - α_k` under `SharedObservation` (see
+[`common_information_moments`](@ref)). The physical-state covariance
+`state_covariances` differs from the filter's `posterior_covariances`.
+"""
+function shared_observation_moments(sgame::StochasticGameProblem{T}, strategy) where {T}
+    g = sgame.nominal_game; dyn = g.dynamics
+    np = num_players(g); N = n_steps(g)
+    obs = sgame.information
+    A = [Matrix{T}(get_A(dyn, k)) for k in 1:N]
+    B = [Matrix{T}(get_B_concatenated(dyn, k)) for k in 1:N]
+    P = [vcat((strategy.gains[i][k] for i in 1:np)...) for k in 1:N]
+    W = [Matrix{T}(get_W(sgame, k)) for k in 1:N]
+    n = size(A[1], 1)
+    H = [observation_matrix(obs, zeros(n), nothing, k) for k in 1:N+1]
+    return common_information_moments(A, B, P, W, H, obs.noise_cov, sgame.initial_covariance)
+end
+
+"""
+    expected_costs_from_moments(sgame, det_sol, Σx, Σu, Σxu) -> Vector
+
+Exact expected player costs of the linear policy: the deterministic cost along
+the mean trajectory plus the covariance terms
+`½tr(QΣx) + ½tr(RΣu) + ⟨M, Cov(x,u)⟩` per stage and `½tr(Qf Σx_{N+1})`,
+scaled by each objective's `scaling`. `Σx` has `N+1` entries, `Σu`/`Σxu` have `N`.
+"""
+function expected_costs_from_moments(sgame::StochasticGameProblem{T}, det_sol, Σx, Σu, Σxu) where {T}
+    g = sgame.nominal_game; dyn = g.dynamics
+    np = num_players(g); N = n_steps(g)
+    n = total_state_dim(dyn); cd = dyn.control_dims; m = sum(cd)
+    offs = [0; cumsum(cd)[1:end-1]]
+    ranges = [offs[i]+1:offs[i]+cd[i] for i in 1:np]
+    out = zeros(T, np)
+    for i in 1:np
+        obj = get_objective(g, i)
+        extra = zero(T)
+        for k in 1:N
+            Q, R, M, _, _ = _joint_cost_mats(obj.stage_cost, i, k, ranges, n, m, T)
+            extra += T(0.5) * tr(Q * Σx[k]) + T(0.5) * tr(R * Σu[k]) + sum(M .* Σxu[k])
+        end
+        extra += T(0.5) * tr(obj.terminal_cost.Qf * Σx[N+1])
+        out[i] = det_sol.trajectories[i].cost + extra * obj.scaling
+    end
+    return out
+end
+
 function _solve(
     sgame::StochasticGameProblem{T},
     solver::SFNELQ,
@@ -125,10 +174,19 @@ function _solve(
         this path is not yet implemented, see DifferentialGamesBase.jl docs/src/api/stochastic.md.
         """)
 
-    sgame.information isa PerfectStateInformation || error("""
-        SFNELQ supports PerfectStateInformation only; got $(typeof(sgame.information)).
-        Shared-observation LQ games need a filtering-aware solver.
+    info = sgame.information
+    (info isa PerfectStateInformation || info isa SharedObservation) || error("""
+        SFNELQ supports PerfectStateInformation and SharedObservation (common linear-Gaussian
+        measurements) only; got $(typeof(info)). The separation of estimation and feedback-Nash
+        control is not valid for private or asymmetric information.
         """)
+    if info isa SharedObservation
+        n = total_state_dim(sgame.nominal_game.dynamics)
+        is_affine_observation(info, n) || error("""
+            SFNELQ requires an affine common observation y = Hx + c + v (unit noise gain);
+            a nonlinear observation model needs an EKF-based solver (e.g. CCiLQGames).
+            """)
+    end
     isempty(all_chance_constraints(sgame)) || error("""
         SFNELQ solves unconstrained games; the problem declares chance constraints.
         Use a chance-constrained solver (e.g. CCiLQGames) instead.
@@ -159,7 +217,23 @@ function _solve(
     solver_info[:noise_cost] = noise_cost
     solver_info[:certainty_equivalent] = true
     solver_info[:expected_costs] = [t.cost for t in trajectories]
-    merge!(solver_info, Dict{Symbol, Any}(pairs(gaussian_trajectory_moments(sgame, det_sol.strategy))))
+    if info isa SharedObservation
+        # Separation: gains are the FNELQ gains applied to the common estimate x̂. The expected
+        # cost is recomputed exactly from the joint law of (x, x̂) rather than from the
+        # perfect-information value-function correction.
+        mom = shared_observation_moments(sgame, det_sol.strategy)
+        ec = expected_costs_from_moments(sgame, det_sol, mom.state_covariances,
+                                         mom.control_covariances, mom.state_control_covariances)
+        trajectories = [Trajectory(t.player_id, t.states, t.controls, t.times, ec[t.player_id])
+                        for t in det_sol.trajectories]
+        solver_info[:noise_cost] = ec .- [t.cost for t in det_sol.trajectories]
+        solver_info[:expected_costs] = ec
+        solver_info[:information] = :shared_observation
+        solver_info[:separation_theorem_used] = true
+        merge!(solver_info, Dict{Symbol, Any}(pairs(mom)))
+    else
+        merge!(solver_info, Dict{Symbol, Any}(pairs(gaussian_trajectory_moments(sgame, det_sol.strategy))))
+    end
 
     return GNEPSolution(
         det_sol.game, trajectories;

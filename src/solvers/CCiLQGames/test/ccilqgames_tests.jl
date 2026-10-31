@@ -115,14 +115,44 @@ end
         @test length(info[:multipliers]) == 1
     end
 
+    @testset "common noisy observations: constraints use the physical-state covariance" begin
+        dt, N = 0.1, 10
+        A = Matrix(1.0I, 2, 2); B = [reshape([dt, 0.0], 2, 1), reshape([0.0, dt], 2, 1)]
+        Q1 = [4.0 0.0; 0.0 0.0]; Q2 = [0.0 0.0; 0.0 4.0]
+        g = LQGameProblem(A, B, [Q1, Q2], [reshape([0.1], 1, 1), reshape([0.1], 1, 1)], [Q1, Q2],
+                          [0.0, 0.0], N * dt; dt = dt, q = [-(Q1 * [1.0, 0.0]), -(Q2 * [0.0, 1.0])])
+        W = Matrix(0.01I, 2, 2)
+        cc = ChanceConstraint(StateBounds(1; state_offset = 0, state_dim = 1, lower = [-5.0], upper = [0.6]), 0.1)
+        obs = linear_observation(Matrix(1.0I, 2, 2), Matrix(0.05I, 2, 2))
+        sg_obs = StochasticGameProblem(g, ProcessNoiseModel(W); chance_constraints = [cc],
+                                       information = obs, initial_covariance = Matrix(0.02I, 2, 2))
+        sg_per = StochasticGameProblem(g, ProcessNoiseModel(W); chance_constraints = [cc],
+                                       initial_covariance = Matrix(0.02I, 2, 2))
+        sol = solve(sg_obs, CCiLQGames(mc_samples = 20000, seed = 4))
+        per = solve(sg_per, CCiLQGames(mc_samples = 0))
+        info = sol.solver_info
+        @test info[:information] === :shared_observation
+        @test info[:status] in (:locally_stationary_surrogate, :surrogate_feasible)
+        @test info[:r_feas] <= 1e-4
+        # noisy estimation makes the physical state more uncertain, so the mean path must back off more
+        @test maximum(sol.state_trajectory[1, 1:N]) < maximum(per.state_trajectory[1, 1:N])
+        # analytic (exact, affine) event probabilities agree with a filter-in-the-loop simulation
+        mc = info[:monte_carlo]
+        ub = filter(c -> c.component == 2, info[:chance_checks])
+        for k in 1:N
+            lo, hi = mc.per_event_interval[2 + 2 * (k - 1)]
+            @test lo - 3e-3 <= ub[k].violation_probability <= hi + 3e-3
+        end
+    end
+
     @testset "informative failures and guards" begin
         A = [1.0 0.1; 0.0 1.0]; B = [reshape([0.0, 0.1], 2, 1)]
         g = LQGameProblem(A, B, [Matrix(1.0I, 2, 2)], [reshape([1.0], 1, 1)],
                           [Matrix(1.0I, 2, 2)], [1.0, 0.0], 1.0; dt = 0.1)
         sg = StochasticGameProblem(g, ProcessNoiseModel(zeros(2, 2)))
         @test_throws ErrorException solve(sg, CCiLQGames(covariance_mode = :consistent_covariance))
-        shared = SharedObservation((x, v, p, t) -> x[1:1] .+ v, 1, reshape([0.1], 1, 1))
-        @test_throws ErrorException solve(StochasticGameProblem(g, ProcessNoiseModel(zeros(2, 2)); information = shared), CCiLQGames())
+        @test_throws ErrorException solve(StochasticGameProblem(g, ProcessNoiseModel(zeros(2, 2));
+                                          information = OpenLoopInformation()), CCiLQGames())
         @test_throws ArgumentError CCiLQGames(covariance_mode = :bogus)
         @test solver_capabilities(CCiLQGames) ⊆ DifferentialGamesBase.CANONICAL_CAPABILITIES
     end

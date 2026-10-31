@@ -153,8 +153,9 @@ end
     g = LQGameProblem(A, B, [Matrix(1.0I, 2, 2)], [reshape([1.0], 1, 1)],
                       [Matrix(1.0I, 2, 2)], [0.0, 0.0], 3.0; dt = 1.0)
     W = ProcessNoiseModel(Matrix(0.01I, 2, 2))
-    shared = SharedObservation((x, v, p, t) -> x[1:1] .+ v, 1, reshape([0.1], 1, 1))
-    @test_throws ErrorException solve(StochasticGameProblem(g, W; information = shared), SFNELQ())
+    nonlinear = SharedObservation((x, v, p, t) -> x[1:1] .^ 2 .+ v, 1, reshape([0.1], 1, 1))
+    @test_throws ErrorException solve(StochasticGameProblem(g, W; information = nonlinear), SFNELQ())
+    @test_throws ErrorException solve(StochasticGameProblem(g, W; information = OpenLoopInformation()), SFNELQ())
     cc = ChanceConstraint(StateBounds(1; state_offset = 0, state_dim = 2,
                                       lower = [-5.0, -5.0], upper = [1.0, 5.0]), 0.05)
     @test_throws ErrorException solve(StochasticGameProblem(g, W; chance_constraints = [cc]), SFNELQ())

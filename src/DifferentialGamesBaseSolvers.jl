@@ -148,7 +148,7 @@ export FNELQ
 export SFNELQ
 export CCiLQGames
 export additive_noise_cost
-export gaussian_trajectory_moments
+export gaussian_trajectory_moments, shared_observation_moments, expected_costs_from_moments
 export get_covariance_trajectory, get_expected_costs, get_mean_trajectory
 export iLQGames
 export ALGAMES

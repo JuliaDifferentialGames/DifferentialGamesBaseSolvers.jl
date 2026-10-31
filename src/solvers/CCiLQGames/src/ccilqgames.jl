@@ -21,8 +21,17 @@
 #     nominal and the policy is neglected), and the covariance trace term of
 #     the expected cost (½tr(QΣ)) is dropped. Stationarity is therefore that of
 #     the frozen-covariance surrogate, NOT of the full stochastic game.
-#   * Perfect state information only; constraints are imposed on the physical
-#     state/control at stages k = 1…N (not on the terminal state).
+#   * Information: PerfectStateInformation, or SharedObservation (common
+#     measurements). With shared observations the policy acts on a common EKF
+#     estimate x̂; the filter gains/Jacobians are fixed along the nominal
+#     trajectory, and constraints use the covariance of the PHYSICAL state and
+#     control (not the posterior estimation covariance), which includes the
+#     estimate-feedback coupling. Separation of estimation and Nash control is
+#     only exact for linear-Gaussian common-information games; for nonlinear
+#     ones it is the usual EKF/certainty-equivalence approximation.
+#     Private/asymmetric observations are rejected.
+#   * Constraints are imposed on the physical state/control at stages
+#     k = 1…N (not on the terminal state).
 # ============================================================================
 
 """
@@ -154,18 +163,31 @@ function _linearize(ctx, X, U)
     return As, Bs
 end
 
-# Physical-state/control covariances under u_k = ū_k - K_k (x_k - x̄_k), Σ₀ = initial covariance.
-function _moments(ctx, As, Bs, K, X, U)
+# Physical-state/control covariances under u_k = ū_k - K_k (x̂_k - x̄_k), Σ₀ = initial covariance.
+# Perfect information: x̂ = x. Shared observation: EKF gains/Jacobians frozen along the nominal.
+function _moments_full(ctx, As, Bs, K, X, U)
+    n = ctx.n
+    Ws = [Matrix{Float64}(_W(ctx, k, X[:, k], U[:, k])) for k in 1:ctx.N]
+    info = ctx.sg.information
+    if info isa SharedObservation
+        H = [observation_matrix(info, X[:, k], nothing, k) for k in 1:ctx.N+1]
+        return common_information_moments(As, Bs, K, Ws, H, info.noise_cov, ctx.sg.initial_covariance)
+    end
     Σ = Matrix(ctx.sg.initial_covariance)
     Σx = Matrix{Float64}[]; Σu = Matrix{Float64}[]; Σxu = Matrix{Float64}[]
     for k in 1:ctx.N
         push!(Σx, copy(Σ)); push!(Σu, Matrix(Symmetric(K[k] * Σ * K[k]')))
         push!(Σxu, -Σ * K[k]')
         F = As[k] - Bs[k] * K[k]
-        Σ = Matrix(Symmetric(F * Σ * F' + _W(ctx, k, X[:, k], U[:, k])))
+        Σ = Matrix(Symmetric(F * Σ * F' + Ws[k]))
     end
     push!(Σx, Σ)
-    return Σx, Σu, Σxu
+    return (state_covariances = Σx, control_covariances = Σu, state_control_covariances = Σxu)
+end
+
+function _moments(ctx, As, Bs, K, X, U)
+    m = _moments_full(ctx, As, Bs, K, X, U)
+    return m.state_covariances, m.control_covariances, m.state_control_covariances
 end
 
 # ─── chance residual events ──────────────────────────────────────────────────
@@ -274,17 +296,33 @@ function _monte_carlo(ctx, solver, X, U, K)
     (isempty(chance) || solver.mc_samples <= 0) && return nothing
     rng = Random.MersenneTwister(solver.seed)
     L0 = DifferentialGamesBase._psd_factor(Matrix(ctx.sg.initial_covariance))
+    info = ctx.sg.information
+    shared = info isa SharedObservation
+    if shared
+        As, Bs = _linearize(ctx, X, U)
+        fm = _moments_full(ctx, As, Bs, K, X, U)
+        Lv = DifferentialGamesBase._psd_factor(Matrix(info.noise_cov))
+    end
     n_events = sum(s.dim for s in chance) * ctx.N
     G = zeros(n_events, solver.mc_samples)
     for s in 1:solver.mc_samples
         x = X[:, 1] + L0 * randn(rng, size(L0, 2)); row = 0
+        if shared   # assimilate y₁ before the first control
+            y = info.observation_model(x, Lv * randn(rng, size(Lv, 2)), nothing, 1)
+            x̂ = X[:, 1] + fm.initial_kalman_gain * (y - info.observation_model(X[:, 1], zeros(info.obs_dim), nothing, 1))
+        end
         for k in 1:ctx.N
-            u = U[:, k] - K[k] * (x - X[:, k])
+            u = U[:, k] - K[k] * ((shared ? x̂ : x) - X[:, k])
             for spec in chance
                 c = evaluate_constraint(spec.inner, x, u, nothing, k)
                 G[row+1:row+spec.dim, s] = c; row += spec.dim
             end
             x = sample_step(rng, ctx.sd, x, u, nothing, _tk(ctx, k))
+            if shared
+                x̂⁻ = _step_mean(ctx, x̂, u, k)
+                y = info.observation_model(x, Lv * randn(rng, size(Lv, 2)), nothing, k + 1)
+                x̂ = x̂⁻ + fm.kalman_gains[k] * (y - info.observation_model(x̂⁻, zeros(info.obs_dim), nothing, k + 1))
+            end
         end
     end
     return empirical_violation_rates(G)
@@ -296,8 +334,9 @@ function _solve(sg::StochasticGameProblem{T}, solver::CCiLQGames, warmstart, ver
     t_start = time()
     solver.covariance_mode === :consistent_covariance && error(
         "CCiLQGames: covariance_mode = :consistent_covariance is not implemented; use :frozen_covariance.")
-    sg.information isa PerfectStateInformation || error(
-        "CCiLQGames supports PerfectStateInformation only; got $(typeof(sg.information)).")
+    (sg.information isa PerfectStateInformation || sg.information isa SharedObservation) || error(
+        "CCiLQGames supports PerfectStateInformation and SharedObservation (common measurements) " *
+        "only; got $(typeof(sg.information)).")
     sde = sg.stochastic_dynamics
     sde isa ItoSDEDynamics || error("CCiLQGames requires ItoSDEDynamics stochastic dynamics.")
     g = sg.nominal_game
@@ -436,6 +475,7 @@ function _ccil_solution(ctx, solver, g, X, U, K, mom, specs, λ, ρ, hist, outer
         :residual_history => hist, :outer_history => outer_hist,
         :outer_iterations => outer,
         :state_covariances => Σx, :control_covariances => Σu, :state_control_covariances => Σxu,
+        :information => ctx.sg.information isa SharedObservation ? :shared_observation : :perfect_state,
         :multipliers => λ, :penalties => ρ,
         :risk_allocation => [s.eps for (_, s) in chance_specs],
         :joint_risk_bound => isempty(chance_specs) ? 0.0 : sum(sum(s.eps) for (_, s) in chance_specs),
