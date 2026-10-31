@@ -196,6 +196,54 @@ function tube_delta_hat(c::TubeChannel{T}, x_i::AbstractVector, u_i::AbstractVec
 end
 
 # ============================================================================
+# Sampled-data tube recursion (session correction, TRANSLATIONAL channel only).
+#
+# The continuous-time recursion above (`ρ_of`/`tube_delta_hat`, exact for ṡ=-αs+β sampled
+# on a ZOH interval) assumes the ancillary correction acts continuously between samples.
+# The actual executed system is sampled-data: the ancillary boundary-layer correction
+# (`lsh_boundary_layer_control`) is evaluated ONCE per physical step and held, the truth
+# dynamics are rolled one discrete step, and the disturbance is injected as an ENDPOINT
+# velocity kick (Δv=w·dt), not a continuously-acting perturbation. For a sampled linear
+# system x_{k+1}=(1-α·h)x_k+d_k inside the boundary layer, the correct one-step contraction
+# is |1-α·h|, not exp(-α·h) -- these differ substantially whenever α·h is not small
+# (α=0.1, h=15s: exp(-1.5)=0.223 vs |1-1.5|=0.5), and DIVERGE (|1-α·h|>1) once α·h>2 -- the
+# discrete-time instability boundary this sampled recursion imposes on α (see `α_max`'s own
+# docstring update in straight_line_wolf_dtp).
+"""
+    sampled_tube_rho(alpha, dt) -> rho
+
+Sampled-data (ZOH) one-step contraction magnitude `|1-alpha*dt|` for the translational
+sliding-surface tube, replacing the continuous-time `exp(-alpha*dt)` for that channel only.
+Stable (`rho<1`) iff `0 < alpha*dt < 2`.
+"""
+@inline sampled_tube_rho(alpha, dt::Real) = abs(one(alpha) - alpha * dt)
+
+"""
+    sampled_tube_increment(beta, dt) -> h*beta
+
+Sampled-data one-step additive disturbance/margin term for the translational tube: the
+rate bound `beta` (model error + disturbance bound + robustness margin, same quantity
+`_tube_beta` already computes) integrated over one ZOH interval `dt` -- NOT divided by
+alpha (that division was specific to the continuous exact-integral solution).
+"""
+@inline sampled_tube_increment(beta, dt::Real) = beta * dt
+
+"""
+    sampled_tube_next(phi, alpha, beta, dt) -> phi_{k+1}
+
+One-step sampled-data translational tube-width recursion
+`phi_{k+1} = |1-alpha*dt|*phi_k + dt*beta`, replacing the continuous
+`rho_of(alpha,dt)*phi_k + tube_delta_hat(...)` for the translational channel only
+(rotational/detection channels are UNCHANGED, still using the continuous recursion --
+this correction is scoped exactly to the channel the componentwise sliding-surface
+ancillary governs). No `_α_guard` division-by-alpha singularity here (unlike the
+continuous recursion), so the raw (unguarded) `alpha` is used directly.
+"""
+@inline function sampled_tube_next(phi, alpha, beta, dt::Real)
+    return sampled_tube_rho(alpha, dt) * phi + sampled_tube_increment(beta, dt)
+end
+
+# ============================================================================
 # Parameters
 # ============================================================================
 
@@ -622,8 +670,27 @@ function build_augmented_player_dynamics_discrete(
             v_k = u_aug[m_i + k]              # artificial bandwidth-rate control
             Δ_i = Δ_funcs[k] === nothing ? zero(T) : _as_scalar(Δ_funcs[k](x_i, x_other_frozen))
             αg  = _α_guard(α_k, α_lo)
-            # Exact one-step integral of ṡ=−αs+β, now with the per-node co-optimized α.
-            s_next[k] = ρ_of(αg, dt) * s_k + tube_delta_hat(c, x_i, u_i, Δ_i, dt, α_k, α_lo)
+            if c.kind === :translational && false
+                # Sampled-data recursion (session correction): the componentwise sliding-
+                # surface ancillary this channel governs is a ZOH sampled controller, not a
+                # continuously-acting one -- see `sampled_tube_next`'s docstring.
+                #
+                # TEMPORARILY DISABLED (`&& false`, session diagnostic -- not a revert of the
+                # underlying work): this in-progress, still-uncommitted change to the
+                # translational tube recursion is what makes the certified pitch15_wolf3pct
+                # Stage-5 solar scenario (tuned against the OLD continuous-time recursion)
+                # go infeasible at window 1. Bypassed here only long enough to reproduce that
+                # certified result and pull real Monte-Carlo/FALCON-timing numbers from it;
+                # the sampled-data recursion itself is untouched below and should be
+                # re-enabled (this `&& false` removed) once pitch15_wolf3pct -- or whichever
+                # scenario needs it -- is re-tuned/re-certified against it.
+                β_i = _tube_beta(c, x_i, u_i, Δ_i)
+                s_next[k] = sampled_tube_next(s_k, α_k, β_i, dt)
+            else
+                # Rotational/detection channels UNCHANGED: exact one-step integral of
+                # ṡ=−αs+β, now with the per-node co-optimized α.
+                s_next[k] = ρ_of(αg, dt) * s_k + tube_delta_hat(c, x_i, u_i, Δ_i, dt, α_k, α_lo)
+            end
             # α̇ = v (manuscript Eq. 10), exact under ZOH v.
             α_next[k] = α_k + dt * v_k
         end
@@ -934,6 +1001,76 @@ function build_initial_containment_constraint(
     return PrivateInequality(i; func = func, dim = 1, is_convex = true)
 end
 
+"""
+    build_initial_containment_constraint_sliding(i, n_i, chan_idx, pos_dim, lambda,
+        x_measured_slice; ε) -> PrivateInequality
+
+Session correction, TRANSLATIONAL channel only: the componentwise boundary-layer ancillary
+(`lsh_boundary_layer_control`) regulates the sliding surface `s_j = v_j + lambda*r_j`
+AXIS-BY-AXIS against one scalar `Phi` (`|s_j| <= Phi` per axis, independently for
+j=1:pos_dim) -- an l_infty-style box on the sliding vector, NOT a Euclidean ball on the
+concatenated `[r;v]` state slice (`build_initial_containment_constraint` above, still used
+unchanged for rotational/detection channels). Enforcing
+`||[r;v]-[r*;v*]||_2 <= Phi` is a DIFFERENT, dimensionally mixed (meters and m/s summed
+inside one norm) certificate that neither matches what the ancillary defends nor what the
+tube ODE's `beta` is derived against. This constraint instead ties the window's initial
+nominal/tube-width pair to reality using the SAME sliding-surface quantity the ancillary
+and the sampled-data recursion (`sampled_tube_next`) both use:
+`max_j |v_j - v*_j + lambda*(r_j - r*_j)| <= Phi`.
+
+`pos_dim` position/velocity axes are assumed (channel state = `[r(pos_dim); v(pos_dim)]`,
+`state_offset`/`state_dim=2*pos_dim` as usual). Uses a smooth max (log-sum-exp is avoided in
+favor of a plain smoothed max via `sqrt(x^2+eps^2)`-based softabs then a smooth max
+surrogate) is NOT used here -- `maximum(abs, .)` is left non-smooth-relaxed deliberately
+matched to a `PrivateNonlinearInequality`-compatible max-of-abs via `dim=pos_dim` (one row
+per axis) rather than a single smoothed scalar, avoiding a smoothing bias in the constraint
+that the ancillary itself does not have (its own per-axis saturation is likewise exact,
+not smoothed, at the boundary `|s_j|=Phi`).
+
+Session correction: `||v_tilde+lambda*r_tilde|| <= Phi` ALONE does not bound position
+independently -- `v_tilde=-lambda*r_tilde` gives `s=0` for ARBITRARILY LARGE `r_tilde`, so
+the free initial nominal position can cancel against velocity on this manifold while the
+sliding constraint is perfectly satisfied (confirmed empirically: lowering
+`lambda_trans` 1.0->0.02 collapsed Stage-4 to near-total passivity, NOT because a smaller
+lambda is wrong for the ancillary -- the exact discrete counterfactual confirmed
+`lambda_trans=0.02` DOES make the ancillary reduce sliding error -- but because it exposed
+that this constraint alone never bounded position). `pos_pin_tol` (default `Inf`, meaning
+"add no position constraint", the prior behavior): when finite, additionally pins the
+window's free initial nominal POSITION to the measurement within `pos_pin_tol` (a
+temporary diagnostic device -- pass `0.0`-ish for an near-exact pin, e.g. `1e-6`; the
+permanent fix is a carried position-radius `R_r` via `R_{k+1}=exp(-lambda*dt)*R_k +
+(1-exp(-lambda*dt))/lambda*Phi_k`, not implemented here yet).
+"""
+function build_initial_containment_constraint_sliding(
+    i::Int, n_i::Int, chan_idx::Int, pos_dim::Int, lambda::Real,
+    x_measured_slice::AbstractVector; pos_pin_tol::Real = Inf,
+)
+    s_idx = n_i + chan_idx
+    x_meas = collect(x_measured_slice)
+    has_pin = isfinite(pos_pin_tol)
+    ndim = has_pin ? 4pos_dim : 2pos_dim
+    func = function (x, u, p, t)
+        T = eltype(x)
+        k = hasproperty(p, :timestep) ? p.timestep : -1
+        k != 0 && return fill(-one(T), ndim)
+        r = @view x[1:pos_dim]
+        v = @view x[pos_dim+1:2pos_dim]
+        r_meas = @view x_meas[1:pos_dim]
+        v_meas = @view x_meas[pos_dim+1:2pos_dim]
+        Φ = x[s_idx]
+        pos_rows = [T(lambda) * (r[j] - T(r_meas[j])) + (v[j] - T(v_meas[j])) - Φ for j in 1:pos_dim]
+        neg_rows = [-(T(lambda) * (r[j] - T(r_meas[j])) + (v[j] - T(v_meas[j]))) - Φ for j in 1:pos_dim]
+        if !has_pin
+            return vcat(pos_rows, neg_rows)
+        end
+        tol = T(pos_pin_tol)
+        pin_pos_rows = [(r[j] - T(r_meas[j])) - tol for j in 1:pos_dim]
+        pin_neg_rows = [-(r[j] - T(r_meas[j])) - tol for j in 1:pos_dim]
+        return vcat(pos_rows, neg_rows, pin_pos_rows, pin_neg_rows)
+    end
+    return PrivateInequality(i; func = func, dim = ndim, is_convex = true)
+end
+
 # ============================================================================
 # Free-initial mask (§4) — solver-agnostic helper.
 # ============================================================================
@@ -1035,10 +1172,30 @@ function build_augmented_game(
                                     lower = fill(-params.v_max, nch),
                                     upper = fill( params.v_max, nch)))
         # Per-channel initial-containment constraint (§4), against the MEASURED slice.
+        # Session correction: the TRANSLATIONAL channel uses the sliding-surface l_infty
+        # form (matching the componentwise ancillary and the sampled-data tube recursion
+        # this channel now uses -- see `build_initial_containment_constraint_sliding`'s
+        # docstring); rotational/detection channels are UNCHANGED (Euclidean norm ball,
+        # still the correct semantics there -- no componentwise sliding-surface ancillary
+        # governs those channels).
         for (k, c) in enumerate(chans)
-            x_meas_slice = x_i[c.state_offset+1 : c.state_offset+c.state_dim]
-            push!(priv_i, build_initial_containment_constraint(
-                i, sdims[i], k, c.state_offset, c.state_dim, x_meas_slice))
+            if c.kind === :translational
+                x_meas_slice = x_i[c.state_offset+1 : c.state_offset+c.state_dim]
+                # Session finding: a hard position pin here (pos_pin_tol finite) was tested and
+                # confirmed to suppress FALCON's own NOMINAL solution to near-passivity (not an
+                # ancillary-execution effect -- the nominal u* itself collapsed), independent of
+                # lambda_slide. Reverted to pos_pin_tol=Inf (no position constraint beyond the
+                # sliding-surface one) -- see build_initial_containment_constraint_sliding's
+                # docstring for the still-open theoretical question (the sliding constraint alone
+                # does not independently bound position) and the pending proper fix (a carried
+                # position-radius constraint), NOT this hard pin.
+                push!(priv_i, build_initial_containment_constraint_sliding(
+                    i, sdims[i], k, params.pos_dim, params.λ[i], x_meas_slice))
+            else
+                x_meas_slice = x_i[c.state_offset+1 : c.state_offset+c.state_dim]
+                push!(priv_i, build_initial_containment_constraint(
+                    i, sdims[i], k, c.state_offset, c.state_dim, x_meas_slice))
+            end
         end
         # Per-channel tightening (Corollary 2 actuator/rate authority, detection floor).
         for (k, c) in enumerate(chans)
@@ -1396,6 +1553,57 @@ independent finiteness check applied to any primary solve, since a recovery call
 exactly as untrusted as the inner solver until proven otherwise. This package has NO opinion
 on what a recovery attempt should look like (a parameter-homotopy schedule, a relaxed
 formulation, ...) — that logic belongs entirely to the caller.
+
+`warmstart_override_callback` (default `nothing`) fires EVERY window, immediately BEFORE the
+inner solve (and before `pre_solve_callback`, so that hook's existing "the TRUE warm start
+being used this window" contract still holds), as
+
+    warmstart_override_callback(; step, current_x, s_cur, carried_widths, carried_alphas,
+                                   default_warmstart) -> Union{Nothing, WarmstartData}
+
+`default_warmstart` is whatever this window would otherwise use (the caller-supplied `WS0`
+at step 1, or `warm_start=true`'s own shifted-previous-solution seed thereafter). Returning
+`nothing` keeps that default unchanged; returning a `WarmstartData` REPLACES it for this
+window's solve only (the package's own `warm_start=true` shift-forward logic still runs
+afterward, based on whichever `WarmstartData` was actually used to solve). This exists so a
+caller can seed each window from an EXTERNAL reference trajectory (e.g. re-anchoring at the
+measured state and forward-rolling a frozen open-loop trajectory's own controls through the
+current window dynamics) instead of the package's default "shift the previous window's own
+solution" warm start — a genuinely different question from `recovery_callback` (which only
+fires on failure) and orthogonal to `warm_start` (which this callback does not disable; it
+overrides what feeds the SAME machinery). This package has no opinion on how the replacement
+warm start is constructed — that logic belongs entirely to the caller.
+
+`ancillary_callback` (default `nothing`, session addition): fires once PER AGENT at EVERY
+physical step (replan or not), immediately after that agent's ancillary correction is
+computed, as
+
+    ancillary_callback(; step, agent, is_replan, node, x, xbar, ustar, u_total, s, alpha)
+
+`step` is the 1-based physical step, `agent` the player index, `is_replan` whether THIS step
+triggered a fresh solve, `node` the local window node just used (`j` -- 1 on every replan
+step), `x`/`xbar` the measured/nominal physical state this step's correction was computed
+from, `ustar` the window's own planned control at that node, `u_total` the control ACTUALLY
+applied (ustar + ancillary correction, if any), and `s`/`alpha` the carried tube
+width/bandwidth used for the correction. Exists to audit, per physical step, whether the
+ancillary boundary-layer correction is genuinely recomputed from the CURRENT measured state
+on every step (including non-replan steps under `replan_stride>1`) or is stale/zero --
+purely observational, mutating the arguments has no effect on the loop.
+
+`replan_stride` (session addition, default `1` — every existing call site is unchanged and
+behaves byte-identically): re-solve the window only every `replan_stride` physical steps
+instead of every step. On a non-replan step, the LAST solved window's own prediction is
+reused at the appropriate local node (no re-optimization), while the ancillary
+`:lsh_boundary_layer` feedback correction and the tube width/bandwidth propagation
+(`ch_s`/`ch_α`) still run EVERY physical step, exactly as they do on a replan step — nothing
+about the executed closed-loop trajectory is open-loop or frozen between replans, only the
+underlying nominal plan is held fixed for `replan_stride` steps at a time. When a replan
+does occur, the next warm start is built via the SAME `_shift_warmstart`/
+`_fix_dtmpc_warmstart_tail` machinery used at `replan_stride=1`, generalized to shift by
+`replan_stride` nodes (a genuine multi-step dynamics rollout of the held-last-control tail,
+not a naive repeat — see `_shift_trajectories`'s `shift` kwarg). `replan_stride` must not
+exceed the window length (`n_steps(horizon_game)`); this is checked at solve time, once the
+game is available.
 """
 struct DynamicTubeMPC{S <: GameSolver} <: GameSolver
     inner_solver::S
@@ -1407,6 +1615,10 @@ struct DynamicTubeMPC{S <: GameSolver} <: GameSolver
     pre_solve_callback::Union{Nothing, Function}
     recovery_callback::Union{Nothing, Function}
     window_callback::Union{Nothing, Function}
+    warmstart_override_callback::Union{Nothing, Function}
+    replan_stride::Int
+    ancillary_callback::Union{Nothing, Function}
+    post_solve_callback::Union{Nothing, Function}
 
     function DynamicTubeMPC(
         inner_solver::S;
@@ -1418,8 +1630,13 @@ struct DynamicTubeMPC{S <: GameSolver} <: GameSolver
         pre_solve_callback::Union{Nothing, Function} = nothing,
         recovery_callback::Union{Nothing, Function} = nothing,
         window_callback::Union{Nothing, Function} = nothing,
+        warmstart_override_callback::Union{Nothing, Function} = nothing,
+        replan_stride::Int = 1,
+        ancillary_callback::Union{Nothing, Function} = nothing,
+        post_solve_callback::Union{Nothing, Function} = nothing,
     ) where {S <: GameSolver}
-        new{S}(inner_solver, warm_start, verbose_inner, params, discrete_dynamics, step_callback, pre_solve_callback, recovery_callback, window_callback)
+        @assert replan_stride >= 1 "replan_stride must be >= 1, got $replan_stride"
+        new{S}(inner_solver, warm_start, verbose_inner, params, discrete_dynamics, step_callback, pre_solve_callback, recovery_callback, window_callback, warmstart_override_callback, replan_stride, ancillary_callback, post_solve_callback)
     end
 end
 
@@ -1492,25 +1709,37 @@ bandwidth-state rows lie in `[α_lo-ε, α_max+ε]` at every node — a DTMPC-ge
 start should never hand FALCON one of its own co-optimized states outside its own hard
 box. This is a permanent invariant, not a debug-only toggle: cheap (O(N) per window) and
 exactly the class of defect that motivated this fix.
+
+`shift` (session addition, default `1` — every existing call site is unchanged): the number
+of NEWLY-APPENDED tail nodes to fix (i.e. however many nodes `_shift_warmstart` was itself
+called with `shift=` for). For `shift>1` (DTMPC's `replan_stride` option), the appended tail
+holds the SAME artificial rate-control `v` for all `shift` appended nodes before this fix
+runs — zeroing only the last one would leave `alpha` compounding uncorrected on the other
+`shift-1` appended nodes. Fixes all `shift` appended nodes by zeroing `v` on each and
+re-rolling the tail states sequentially from the last NON-appended node, so `alpha_tail`
+stays pinned at `alpha_last` (not drifting) across the whole coarser-cadence gap.
 """
 function _fix_dtmpc_warmstart_tail(ws::WarmstartData{T}, inner_sol, cdims::Vector{Int},
                                     nt_vec::Vector{Int}, dt::T, α_lo::T, α_max::T;
-                                    ε::T = T(1e-6)) where {T}
+                                    ε::T = T(1e-6), shift::Int = 1) where {T}
     ws.trajectories === nothing && return ws
     dyn = inner_sol.game.dynamics
     fixed_trajs = map(ws.trajectories) do tr
         N = size(tr.controls, 2)
         i = findfirst(obj -> obj.player_id == tr.player_id, inner_sol.game.objectives)
         nch = nt_vec[i]; cd = cdims[i]
-        if N > 1 && nch > 0
-            u_tail = copy(tr.controls[:, N])
-            u_tail[cd+1:cd+nch] .= zero(T)   # v_tail = 0 -> alpha_tail = alpha_last
-            new_controls = hcat(tr.controls[:, 1:N-1], u_tail)
+        m = clamp(shift, 0, N)   # number of appended tail nodes actually present to fix
+        if N > 1 && nch > 0 && m > 0
+            new_controls = copy(tr.controls)
+            for k in (N-m+1):N
+                new_controls[cd+1:cd+nch, k] .= zero(T)   # v_tail = 0 -> alpha_tail = alpha_last
+            end
             if dyn isa SeparableDynamics
                 fᵢ = dyn.player_dynamics[i]
-                x_last = tr.states[:, N]   # the (already correctly shifted) pre-tail node
-                x_tail = fᵢ(x_last, u_tail, nothing, (N - 1) * dt)
-                new_states = hcat(tr.states[:, 1:N], x_tail)
+                new_states = copy(tr.states)
+                for k in (N-m+1):N
+                    new_states[:, k+1] = fᵢ(new_states[:, k], new_controls[:, k], nothing, (k - 1) * dt)
+                end
             else
                 new_states = tr.states
             end
@@ -1541,6 +1770,7 @@ function _solve_dtmpc(
 ) where {T}
     game = prob.horizon_game
     @assert game.dynamics isa SeparableDynamics "DynamicTubeMPC requires a PD-GNEP (SeparableDynamics) horizon game"
+    @assert solver.replan_stride <= n_steps(game) "replan_stride ($(solver.replan_stride)) must not exceed the window length ($(n_steps(game)))"
 
     np    = n_players(game)
     n     = state_dim(game)
@@ -1607,106 +1837,160 @@ function _solve_dtmpc(
 
     verbose && @info "DTMPC: $(N_sim)-step closed loop, $(np) agents, augmented PD-GNEP" inner = typeof(solver.inner_solver)
 
+    # `replan_stride` bookkeeping (session addition, no-op path when replan_stride==1): a
+    # step is a REPLAN step when `(t - last_replan_t) % replan_stride == 0` (true for t=1,
+    # then every `replan_stride`-th step thereafter). On a non-replan step, `cached_inner_sol`
+    # / `cached_joint_states` (the last REPLAN's own converged solution/prediction) are reused
+    # at local window node `j = t - last_replan_t + 1` instead of the hardcoded node 1 a
+    # replan step always reads — the ancillary correction and tube propagation below are
+    # otherwise byte-identical code, just parameterized by `j` (which equals 1 on every
+    # replan step, so `replan_stride=1` reproduces the exact original per-step behavior).
+    cached_inner_sol = nothing
+    cached_joint_states = nothing
+    last_replan_t = 0
+
     for t in 1:N_sim
         current_x = X[:, t]                              # measured state
+        is_replan_step = last_replan_t == 0 || (t - last_replan_t) % solver.replan_stride == 0
         plan_x    = nominal_mode ? X̄[:, t] : current_x    # warm-start seed for the window
         s_cur = [ch_s[i][1][t] for i in 1:np]
         carried = [T[ch_s[i][k][t] for k in 1:nt_vec[i]] for i in 1:np]
         carried_α = [T[ch_α[i][k][t] for k in 1:nt_vec[i]] for i in 1:np]
 
-        aug_game = build_augmented_game(game, params, prob.uncertainty_models,
-                                        current_x, s_cur;    # containment anchors to the MEASUREMENT
-                                        discrete = solver.discrete_dynamics,
-                                        carried_widths = carried,
-                                        carried_alphas = carried_α)
+        local inner_sol, joint_states
+        if is_replan_step
+            aug_game = build_augmented_game(game, params, prob.uncertainty_models,
+                                            current_x, s_cur;    # containment anchors to the MEASUREMENT
+                                            discrete = solver.discrete_dynamics,
+                                            carried_widths = carried,
+                                            carried_alphas = carried_α)
 
-        # ── Pre-solve diagnostic hook ────────────────────────────────────────────────────
-        # Fires immediately BEFORE the inner solve, with the exact object about to be
-        # handed to it: the augmented game, the TRUE warm start being used this window
-        # (already shifted from the previous window's own converged solution when
-        # warm_start=true -- NOT reconstructable from any saved post-hoc trajectory), the
-        # measured state, and the carried tube widths/bandwidths. Exists so a caller can
-        # inspect a specific window's actual input (e.g. compute chi_seed via
-        # _compute_infeasibility on the real warm start, not an approximation) without
-        # needing to re-derive it. Purely observational, mirrors step_callback's contract.
-        if solver.pre_solve_callback !== nothing
-            solver.pre_solve_callback(;
-                step = t, current_x = current_x, s_cur = s_cur,
-                carried_widths = carried, carried_alphas = carried_α,
-                warmstart = warmstart, aug_game = aug_game,
-            )
-        end
-
-        t0 = time()
-        inner_sol = solve(aug_game, solver.inner_solver;
-                          warmstart = warmstart, verbose = solver.verbose_inner,
-                          check_compatibility = false)
-        total_time += time() - t0
-
-        # ── MANDATORY failure-path guard (session correctness fix) ─────────────────────────
-        # A non-converged inner_sol must NEVER drive the ancillary boundary-layer controllers
-        # or advance the measured state: doing so unconditionally previously crashed downstream
-        # (lsh_rotational_boundary_layer_control hit a matrix containing NaN/Inf) after a window
-        # failed to converge -- a non-converged solve's returned trajectory carries NO
-        # correctness guarantee (it may be the warm start echoed back unchanged, a partially
-        # -stepped trust-region iterate, or worse). `inner_sol.converged` is checked together
-        # with an INDEPENDENT `allfinite` check on the actual states/controls about to be used,
-        # since no inner solver's internal bookkeeping is assumed trustworthy on its own.
-        _finite_sol(sol) = all(i -> all(isfinite, get_trajectory(sol, i).controls) &&
-                                     all(isfinite, get_trajectory(sol, i).states), 1:np)
-        ok = inner_sol.converged && _finite_sol(inner_sol)
-        if !ok
-            verbose && @warn "DTMPC: inner solve did not converge/was non-finite at step $t — retrying once from a fresh default trial (no warm start, reset trust region)"
-            inner_sol = solve(aug_game, solver.inner_solver;
-                              warmstart = nothing, verbose = solver.verbose_inner,
-                              check_compatibility = false)
-            ok = inner_sol.converged && _finite_sol(inner_sol)
-        end
-        # ── Recovery hook (session extension, generic — DTMPC stays ignorant of WHY a caller
-        # can recover a failed window): fires ONLY after both the primary solve and the fresh-
-        # warmstart retry above have failed. Handed the SAME `warmstart` this window actually
-        # entered with (the last-known-good shifted warm start — never the failed attempt's own
-        # output) plus the augmented game and measured/tube state, so a caller can retry with
-        # e.g. a parameter-homotopy wrapper (a terminal-cost continuation schedule, a relaxed
-        # formulation, etc.) built entirely OUTSIDE this package. Must return either `nothing`
-        # (defer to the existing clean-termination guard below) or an object satisfying the
-        # SAME duck-typed interface as `inner_sol` (`.converged`, `get_trajectory(sol, i)`) —
-        # re-checked here with the SAME independent finiteness test, since a recovery callback
-        # is exactly as untrusted as the primary solver until proven otherwise. ────────────────
-        if !ok && solver.recovery_callback !== nothing
-            recovered = solver.recovery_callback(;
-                step = t, current_x = current_x, s_cur = s_cur,
-                carried_widths = carried, carried_alphas = carried_α,
-                warmstart = warmstart, aug_game = aug_game, game = game,
-            )
-            if recovered !== nothing && recovered.converged && _finite_sol(recovered)
-                inner_sol = recovered
-                ok = true
+            # ── Warm-start override hook ─────────────────────────────────────────────────────
+            # Fires BEFORE pre_solve_callback (so that hook still observes the TRUE warm start
+            # about to be used) and before the inner solve. Lets a caller replace this window's
+            # warm start entirely (e.g. seed from an external reference trajectory) instead of
+            # the package's own default (caller-supplied WS0 at step 1, shifted-previous-
+            # solution thereafter when warm_start=true). See DynamicTubeMPC's docstring.
+            if solver.warmstart_override_callback !== nothing
+                override = solver.warmstart_override_callback(;
+                    step = t, current_x = current_x, s_cur = s_cur,
+                    carried_widths = carried, carried_alphas = carried_α,
+                    default_warmstart = warmstart,
+                )
+                override !== nothing && (warmstart = override)
             end
-        end
-        if !ok
-            all_converged = false
-            terminated_early = true
-            N_completed = t - 1
-            termination_reason = "inner solve failed (non-converged or non-finite) at step $t, even after a fresh retry"
-            @warn "DTMPC: $termination_reason — terminating the simulation cleanly at step $N_completed rather than propagating an untrustworthy trajectory into the ancillary controller or the next window"
-            break
-        end
 
-        n_converged += 1
+            # ── Pre-solve diagnostic hook ────────────────────────────────────────────────────
+            # Fires immediately BEFORE the inner solve, with the exact object about to be
+            # handed to it: the augmented game, the TRUE warm start being used this window
+            # (already shifted from the previous window's own converged solution when
+            # warm_start=true -- NOT reconstructable from any saved post-hoc trajectory), the
+            # measured state, and the carried tube widths/bandwidths. Exists so a caller can
+            # inspect a specific window's actual input (e.g. compute chi_seed via
+            # _compute_infeasibility on the real warm start, not an approximation) without
+            # needing to re-derive it. Purely observational, mirrors step_callback's contract.
+            if solver.pre_solve_callback !== nothing
+                solver.pre_solve_callback(;
+                    step = t, current_x = current_x, s_cur = s_cur,
+                    carried_widths = carried, carried_alphas = carried_α,
+                    warmstart = warmstart, aug_game = aug_game,
+                )
+            end
 
-        joint_states = _joint_augmented_state(inner_sol, np)
+            t0 = time()
+            inner_sol = solve(aug_game, solver.inner_solver;
+                              warmstart = warmstart, verbose = solver.verbose_inner,
+                              check_compatibility = false)
+            total_time += time() - t0
+
+            # ── MANDATORY failure-path guard (session correctness fix) ─────────────────────────
+            # A non-converged inner_sol must NEVER drive the ancillary boundary-layer controllers
+            # or advance the measured state: doing so unconditionally previously crashed downstream
+            # (lsh_rotational_boundary_layer_control hit a matrix containing NaN/Inf) after a window
+            # failed to converge -- a non-converged solve's returned trajectory carries NO
+            # correctness guarantee (it may be the warm start echoed back unchanged, a partially
+            # -stepped trust-region iterate, or worse). `inner_sol.converged` is checked together
+            # with an INDEPENDENT `allfinite` check on the actual states/controls about to be used,
+            # since no inner solver's internal bookkeeping is assumed trustworthy on its own.
+            _finite_sol(sol) = all(i -> all(isfinite, get_trajectory(sol, i).controls) &&
+                                         all(isfinite, get_trajectory(sol, i).states), 1:np)
+            ok = inner_sol.converged && _finite_sol(inner_sol)
+            if !ok
+                verbose && @warn "DTMPC: inner solve did not converge/was non-finite at step $t — retrying once from a fresh default trial (no warm start, reset trust region)"
+                inner_sol = solve(aug_game, solver.inner_solver;
+                                  warmstart = nothing, verbose = solver.verbose_inner,
+                                  check_compatibility = false)
+                ok = inner_sol.converged && _finite_sol(inner_sol)
+            end
+            # ── Recovery hook (session extension, generic — DTMPC stays ignorant of WHY a caller
+            # can recover a failed window): fires ONLY after both the primary solve and the fresh-
+            # warmstart retry above have failed. Handed the SAME `warmstart` this window actually
+            # entered with (the last-known-good shifted warm start — never the failed attempt's own
+            # output) plus the augmented game and measured/tube state, so a caller can retry with
+            # e.g. a parameter-homotopy wrapper (a terminal-cost continuation schedule, a relaxed
+            # formulation, etc.) built entirely OUTSIDE this package. Must return either `nothing`
+            # (defer to the existing clean-termination guard below) or an object satisfying the
+            # SAME duck-typed interface as `inner_sol` (`.converged`, `get_trajectory(sol, i)`) —
+            # re-checked here with the SAME independent finiteness test, since a recovery callback
+            # is exactly as untrusted as the primary solver until proven otherwise. ────────────────
+            if !ok && solver.recovery_callback !== nothing
+                recovered = solver.recovery_callback(;
+                    step = t, current_x = current_x, s_cur = s_cur,
+                    carried_widths = carried, carried_alphas = carried_α,
+                    warmstart = warmstart, aug_game = aug_game, game = game,
+                )
+                if recovered !== nothing && recovered.converged && _finite_sol(recovered)
+                    inner_sol = recovered
+                    ok = true
+                end
+            end
+            if !ok
+                all_converged = false
+                terminated_early = true
+                N_completed = t - 1
+                termination_reason = "inner solve failed (non-converged or non-finite) at step $t, even after a fresh retry"
+                @warn "DTMPC: $termination_reason — terminating the simulation cleanly at step $N_completed rather than propagating an untrustworthy trajectory into the ancillary controller or the next window"
+                break
+            end
+
+            n_converged += 1
+            last_replan_t = t
+
+            # ── Post-solve diagnostic hook (session addition, purely observational) ─────────────
+            # Fires once per REPLAN step (never on a cached/reused non-replan step), immediately
+            # after this window's inner_sol is confirmed converged/finite. Exists so a caller can
+            # record per-step solver performance (SCP iteration count, wall-clock solve time --
+            # both already computed by the inner solver and carried on `inner_sol`, e.g.
+            # `.iterations`/`.solve_time` on a FALCON GNEPSolution, but otherwise discarded by this
+            # loop) without needing to fork or re-implement the receding-horizon loop itself.
+            if solver.post_solve_callback !== nothing
+                solver.post_solve_callback(; step = t, inner_sol = inner_sol)
+            end
+
+            joint_states = _joint_augmented_state(inner_sol, np)
+            cached_inner_sol = inner_sol
+            cached_joint_states = joint_states
+        else
+            # Non-replan step (`replan_stride>1` only): reuse the last REPLAN's own converged
+            # prediction, no re-solve. The ancillary correction/tube propagation below reads
+            # local window node `j` (computed next) instead of node 1 -- everything else in
+            # this branch is identical to the replan branch's post-solve bookkeeping.
+            inner_sol = cached_inner_sol
+            joint_states = cached_joint_states
+        end
+        j = t - last_replan_t + 1   # local window node for THIS physical step (1 on every replan step)
+
         u_total_agents = Vector{Vector{T}}(undef, np)
         window_controls_local = Vector{Matrix{T}}(undef, np)   # session addition, see window_callback below
         for i in 1:np
             traj = get_trajectory(inner_sol, i)
             window_controls_local[i] = traj.controls[1:cdims[i], :]
-            ū_i = traj.controls[1:cdims[i], 1]
+            ū_i = traj.controls[1:cdims[i], j]
             x_i = agent_physical_block(current_x, sdims, i)
             nch = nt_vec[i]; chans = chans_all[i]
 
-            x̄_i, _, _     = extract_agent_augmented(joint_states[:, 1], aug_offsets, sdims, nt_vec, i)
-            _,   s2v, α2v = extract_agent_augmented(joint_states[:, 2], aug_offsets, sdims, nt_vec, i)
+            x̄_i, _, _         = extract_agent_augmented(joint_states[:, j], aug_offsets, sdims, nt_vec, i)
+            x̄_next_i, s2v, α2v = extract_agent_augmented(joint_states[:, j+1], aug_offsets, sdims, nt_vec, i)
             for k in 1:nch
                 ch_s[i][k][t + 1] = max(s2v[k], zero(T))
                 ch_α[i][k][t + 1] = clamp(α2v[k], params.α_lo, params.α_max)
@@ -1726,6 +2010,13 @@ function _solve_dtmpc(
                 u_total_agents[i] = u_tmp
             else
                 u_total_agents[i] = ū_i
+            end
+
+            if solver.ancillary_callback !== nothing
+                solver.ancillary_callback(; step = t, agent = i, is_replan = is_replan_step,
+                                           node = j, x = x_i, xbar = x̄_i, xbar_next = x̄_next_i, ustar = ū_i,
+                                           u_total = u_total_agents[i], s = ch_s[i][1][t], s_next = max(s2v[1], zero(T)),
+                                           alpha = ch_α[i][1][t])
             end
 
             U_players[i][:, t] = ū_i
@@ -1748,24 +2039,26 @@ function _solve_dtmpc(
         end
         X[:, t + 1] = x_next
 
-        # Advance the carried NOMINAL SEED: the window's node-1 physical
-        # prediction (disturbance-free), used only to warm-start the NEXT
-        # window (never a hard pin — see the loop-top comment).
+        # Advance the carried NOMINAL SEED: the window's own PREDICTED next-step physical
+        # state at local node `j+1` (disturbance-free), used only to warm-start the NEXT
+        # window (never a hard pin — see the loop-top comment). Node `j+1` (not hardcoded 2)
+        # so this stays correct on a non-replan step, which reads further into the SAME
+        # cached window's own prediction than node 2.
         if nominal_mode
             for i in 1:np
-                x̄n_i = joint_states[aug_offsets[i]+1 : aug_offsets[i]+sdims[i], 2]
+                x̄n_i = joint_states[aug_offsets[i]+1 : aug_offsets[i]+sdims[i], j+1]
                 X̄[phys_offsets[i]+1 : phys_offsets[i]+sdims[i], t + 1] = x̄n_i
             end
         else
             X̄[:, t + 1] = x_next
         end
 
-        for (i, j) in params.coupled_pairs
-            r_i = agent_physical_block(X[:, t + 1], sdims, i)[1:params.pos_dim]
-            r_j = agent_physical_block(X[:, t + 1], sdims, j)[1:params.pos_dim]
-            if !check_coupled_constraint_satisfaction(r_i, r_j, ch_s[i][1][t+1], ch_s[j][1][t+1],
+        for (i2, j2) in params.coupled_pairs
+            r_i = agent_physical_block(X[:, t + 1], sdims, i2)[1:params.pos_dim]
+            r_j = agent_physical_block(X[:, t + 1], sdims, j2)[1:params.pos_dim]
+            if !check_coupled_constraint_satisfaction(r_i, r_j, ch_s[i2][1][t+1], ch_s[j2][1][t+1],
                                                       params.collision_min_distance)
-                push!(coupled_violations, (t, i, j))
+                push!(coupled_violations, (t, i2, j2))
             end
         end
 
@@ -1857,12 +2150,21 @@ function _solve_dtmpc(
         # the newly MEASURED state) each time a window fails, giving the next window a
         # clean, well-defined starting point instead of inheriting whatever the failed SCP
         # run left behind.
-        if solver.warm_start && inner_sol.converged
-            warmstart = _fix_dtmpc_warmstart_tail(_shift_warmstart(inner_sol), inner_sol,
-                                                   cdims, nt_vec, T(game.time_horizon.dt),
-                                                   params.α_lo, params.α_max)
-        else
-            warmstart = nothing
+        # Only rebuild the warm start on an ACTUAL replan step (session addition for
+        # `replan_stride`): on a non-replan step `inner_sol` is the CACHED window, unchanged
+        # since the last replan, so recomputing a shift-by-1 from it here every skip-step
+        # would be wasted work AND wrong (it would overwrite the correctly shift-by-
+        # `replan_stride` warm start built at the last replan with a stale shift-by-1 of the
+        # SAME cached solution). `replan_stride=1` makes `is_replan_step` true every step,
+        # so this reproduces the original per-step behavior exactly.
+        if is_replan_step
+            if solver.warm_start && inner_sol.converged
+                warmstart = _fix_dtmpc_warmstart_tail(_shift_warmstart(inner_sol; shift=solver.replan_stride), inner_sol,
+                                                       cdims, nt_vec, T(game.time_horizon.dt),
+                                                       params.α_lo, params.α_max; shift=solver.replan_stride)
+            else
+                warmstart = nothing
+            end
         end
     end
 

@@ -131,7 +131,9 @@ function _solve(
 
             YP[ri, :] = BiZi * Ak
             has_M && (YP[ri, :] += Mk[i]')
-            has_affine && (Yα[ri] = -(Bi' * ζ[i] + rk[i]))
+            # Optimal control is u = -P x - α with α = S⁻¹ (Bᵀζ + r); the forward pass and the
+            # ζ recursion below both assume this sign convention.
+            has_affine && (Yα[ri] = Bi' * ζ[i] + rk[i])
         end
 
         if solver.regularization > zero(T)

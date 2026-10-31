@@ -85,6 +85,14 @@ Default hyperparameters match the paper's recommended settings (ρ_init=1,
 
 ## Warm-start
 - `reset_duals`  : If false, load λ, ρ, μ from WarmstartData     (true)
+
+## Terminal constraints
+- `terminal_constraints` : If true, also enforce the state-only constraints at the
+                   terminal state x(N+1) (default false). Constraints act on
+                   (x(k), u(k)) for k = 1…N; the terminal state has no control, so
+                   any constraint row that depends on u (e.g. control bounds) is
+                   excluded at the terminal node, and the remaining rows are
+                   evaluated at (x(N+1), 0).
 """
 @kwdef struct ALGAMES <: GameSolver
     outer_iter  ::Int     = 50
@@ -100,6 +108,7 @@ Default hyperparameters match the paper's recommended settings (ρ_init=1,
     tol_dyn     ::Float64 = 1e-4
     tol_con     ::Float64 = 1e-3
     reset_duals ::Bool    = true
+    terminal_constraints ::Bool = false
 end
 
 function solver_capabilities(::Type{ALGAMES})
@@ -137,6 +146,8 @@ Mutable primal-dual workspace for the Newton iterate.
 
 ## Cached dimensions
 - `n`, `np`, `N`, `nc_step` : problem sizes
+- `n_con_nodes`, `term_mask` : number of time nodes carrying constraints (N or N+1) and the
+  rows of the constraint vector that are enforced at the terminal node
 - `control_dims`    : [m₁, …, mₙₚ]
 - `control_offsets` : zero-based start of each player's slice in joint u
 """
@@ -152,6 +163,8 @@ mutable struct ALGAMESWorkspace{T}
     nc_step         ::Int
     control_dims    ::Vector{Int}
     control_offsets ::Vector{Int}
+    n_con_nodes     ::Int            # N, or N+1 with terminal constraints
+    term_mask       ::Vector{Bool}   # per constraint row: enforced at the terminal node
 end
 
 # ============================================================================
@@ -187,7 +200,10 @@ function ALGAMESWorkspace(
 
     # ── Constraint dimension ─────────────────────────────────────────────────
     nc_step   = _count_nc_step(game)
-    n_c_total = nc_step * N
+    use_term  = solver.terminal_constraints && nc_step > 0
+    n_nodes   = use_term ? N + 1 : N
+    term_mask = use_term ? _terminal_mask(game, n, sum(cdim)) : Bool[]
+    n_c_total = nc_step * n_nodes
 
     # ── Dual initialisation ──────────────────────────────────────────────────
     Λ_dyn = [zeros(T, n, N) for _ in 1:np]
@@ -214,7 +230,7 @@ function ALGAMESWorkspace(
     end
 
     return ALGAMESWorkspace{T}(
-        X, U, Λ_dyn, λ, ρ, n, np, N, nc_step, cdim, coff
+        X, U, Λ_dyn, λ, ρ, n, np, N, nc_step, cdim, coff, n_nodes, term_mask
     )
 end
 
@@ -396,9 +412,9 @@ function _dual_ascent!(ws::ALGAMESWorkspace{T}, game::GameProblem{T}) where {T}
     ws.nc_step == 0 && return
     U_flat = _concat_controls(ws)
 
-    for k in 1:ws.N
+    for k in 1:ws.n_con_nodes
         x_k = ws.X[:, k]
-        u_k = U_flat[:, k]
+        u_k = k <= ws.N ? U_flat[:, k] : zeros(T, size(U_flat, 1))
         λ_k = view(ws.λ, (k-1)*ws.nc_step+1 : k*ws.nc_step)
         ρ_k = view(ws.ρ, (k-1)*ws.nc_step+1 : k*ws.nc_step)
         off = 0
@@ -409,6 +425,7 @@ function _dual_ascent!(ws::ALGAMESWorkspace{T}, game::GameProblem{T}) where {T}
             nc = length(cv)
             for j in 1:nc
                 g     = off + j
+                k > ws.N && !ws.term_mask[g] && continue   # row not enforced at the terminal node
                 new_λ = λ_k[g] + ρ_k[g] * cv[j]
                 λ_k[g] = is_inequality(c) ? max(zero(T), new_λ) : new_λ
             end

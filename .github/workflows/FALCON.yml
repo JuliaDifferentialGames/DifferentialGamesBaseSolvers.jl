@@ -1,0 +1,33 @@
+name: FALCON extension
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+jobs:
+  falcon-ext:
+    name: FALCON soft dependency - Julia ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        version:
+          - '1.11'
+          - '1.12'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/cache@v2
+      - name: Test the extension with FALCON installed
+        shell: julia --color=yes {0}
+        run: |
+          using Pkg
+          Pkg.activate(temp = true)
+          Pkg.develop(path = ".")
+          Pkg.add(url = "https://github.com/BennetOutland/FALCON.jl")
+          Pkg.add("Test")
+          include(joinpath(pwd(), "test", "falcon_ext_test.jl"))

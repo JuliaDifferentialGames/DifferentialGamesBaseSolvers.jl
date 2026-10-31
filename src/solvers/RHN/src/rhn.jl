@@ -224,15 +224,50 @@ short seed. `times` are window-local and therefore unchanged, matching the conve
 
 The stale first column is harmless: the consumer overwrites node 1 with the true measured
 initial state before solving.
+
+`shift` (session addition, default `1` — every existing call site is unchanged): drop the
+first `shift` nodes instead of just 1, and dynamically roll `shift` new tail nodes forward
+instead of 1, by folding the single-step shift above `shift` times. Each fold holds THAT
+fold's own terminal control constant while rolling one more step (so the net effect over
+`shift` folds is: physical/tube state dynamically propagated `shift` steps forward, control
+held at the ORIGINAL window's own terminal control value for the entire appended tail — the
+same classical hold-last-control convention, just extended over a longer coarser-cadence
+gap). Used by `DynamicTubeMPC`'s `replan_stride` option (replan every `replan_stride`
+physical steps instead of every step) to build a warm start for the NEXT replan that is
+still a genuine multi-step dynamics rollout, not a naive `shift`-node repeat.
 """
-function _shift_trajectories(trajs::Vector{Trajectory{T}}, game::GameProblem{T}, dt::T) where {T}
+function _shift_trajectories(trajs::Vector{Trajectory{T}}, game::GameProblem{T}, dt::T; shift::Int=1) where {T}
+    shift <= 0 && return trajs
+    result = trajs
+    for _ in 1:shift
+        result = _shift_trajectories_once(result, game, dt)
+    end
+    return result
+end
+
+function _shift_trajectories_once(trajs::Vector{Trajectory{T}}, game::GameProblem{T}, dt::T) where {T}
     dyn = game.dynamics
     map(trajs) do tr
         N = size(tr.controls, 2)
         if N > 1
             new_states_prefix = tr.states[:, 2:N+1]
             new_controls      = hcat(tr.controls[:, 2:N], tr.controls[:, N:N])
-            if dyn isa SeparableDynamics
+            if dyn isa SeparableDynamics && size(tr.states, 1) == sum(game.metadata.state_dims)
+                # JOINT-state trajectories (what ALGAMES and iLQGames store for a PDGNEProblem:
+                # every player's `states` holds all players' stacked states). Roll each player's
+                # block forward with its own dynamics and its own held-last control.
+                sdims = game.metadata.state_dims
+                soffs = game.metadata.state_offsets
+                x_last = new_states_prefix[:, N]
+                x_new_tail = similar(x_last)
+                for (j, objj) in enumerate(game.objectives)
+                    trj = trajs[findfirst(t -> t.player_id == objj.player_id, trajs)]
+                    uj_last = trj.controls[:, min(N, size(trj.controls, 2))]
+                    rng = soffs[j]+1 : soffs[j]+sdims[j]
+                    x_new_tail[rng] = dyn.player_dynamics[j](x_last[rng], uj_last, nothing, (N - 1) * dt)
+                end
+                new_states = hcat(new_states_prefix, x_new_tail)
+            elseif dyn isa SeparableDynamics
                 i = findfirst(obj -> obj.player_id == tr.player_id, game.objectives)
                 fᵢ = dyn.player_dynamics[i]
                 x_last = new_states_prefix[:, N]
@@ -270,7 +305,7 @@ warm start, which is the entire point of a receding-horizon loop. Consumers all 
 `isnothing`/length checks (see FALCON's `_try_load_dual!`), so supplying real data here is
 backward compatible.
 """
-function _shift_warmstart(sol::GNEPSolution{T}) where {T}
+function _shift_warmstart(sol::GNEPSolution{T}; shift::Int=1) where {T}
     shifted_strat = if sol.strategy isa FeedbackStrategy
         _shift_feedback_strategy(sol.strategy)
     elseif sol.strategy isa OpenLoopStrategy
@@ -280,7 +315,7 @@ function _shift_warmstart(sol::GNEPSolution{T}) where {T}
     end
 
     shifted_trajs = isnothing(sol.trajectories) ? nothing :
-        _shift_trajectories(sol.trajectories, sol.game, sol.game.time_horizon.dt)
+        _shift_trajectories(sol.trajectories, sol.game, sol.game.time_horizon.dt; shift=shift)
 
     # Carry dual variables. Try the generic key first, then the keys FALCON actually
     # emits; wrap in a Dict{Symbol,Any} so downstream `haskey` lookups work uniformly.

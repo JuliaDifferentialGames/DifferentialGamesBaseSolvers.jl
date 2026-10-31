@@ -313,7 +313,7 @@ function _unpack_y(ws_ref::ALGAMESWorkspace{T}, y::AbstractVector{S}) where {T, 
 
     return ALGAMESWorkspace{S}(
         X_new, U_new, Λ_new, λ_new, ρ_new,
-        n, np, N, ws_ref.nc_step, cdim, coff
+        n, np, N, ws_ref.nc_step, cdim, coff, ws_ref.n_con_nodes, ws_ref.term_mask
     )
 end
 
@@ -539,6 +539,25 @@ function _G_into!(G       ::AbstractVector{S},
         # ── Dynamics residual row (one per step, not per player) ──────────
         @views G[_Gdyn_idx(ws, k)] .= D_k
     end
+
+    # ── Terminal-node constraint penalty (opt-in: ALGAMES(terminal_constraints=true)) ──
+    # Enforced on x(N+1) only; rows that depend on u are masked out (see `_terminal_mask`).
+    # Adds Jcxᵀ·pen to the stationarity row of x(N+1) for every player, exactly as stage
+    # constraints do for x(k).
+    if ws.n_con_nodes > N
+        x_T = ws.X[:, N+1]
+        C_T, Jcx_T = if Jcx_list !== nothing
+            Cv, _, _ = _terminal_con_eval(game, ws, x_T; with_jacobian = false)
+            Cv, Jcx_list[N+1]
+        else
+            Cv, Jx, _ = _terminal_con_eval(game, ws, x_T)
+            Cv, Jx
+        end
+        pen_T = _al_pen(C_T, ws, N+1, game)
+        for i in 1:np
+            @views G[_Gx_idx(ws, i, N)] .+= Jcx_T' * pen_T
+        end
+    end
 end
 
 # ============================================================================
@@ -576,8 +595,8 @@ function _precompute_step_jacs(
 
     Ak_list  = Vector{Matrix{T}}(undef, N)
     Bk_list  = Vector{Matrix{T}}(undef, N)
-    Jcx_list = Vector{Matrix{T}}(undef, N)
-    Jcu_list = Vector{Matrix{T}}(undef, N)
+    Jcx_list = Vector{Matrix{T}}(undef, ws.n_con_nodes)
+    Jcu_list = Vector{Matrix{T}}(undef, ws.n_con_nodes)
 
     for k in 1:N
         x_k = ws.X[:, k]
@@ -589,6 +608,11 @@ function _precompute_step_jacs(
             Jcx_list[k] = Matrix{T}(undef, 0, n)
             Jcu_list[k] = Matrix{T}(undef, 0, m)
         end
+    end
+    if ws.n_con_nodes > N      # terminal node: masked state Jacobian, no control dependence
+        _, Jx_T, _ = _terminal_con_eval(game, ws, ws.X[:, N+1])
+        Jcx_list[N+1] = Jx_T
+        Jcu_list[N+1] = zeros(T, ws.nc_step, m)
     end
     return Ak_list, Bk_list, Jcx_list, Jcu_list
 end
@@ -774,12 +798,18 @@ function _constraint_violation(game::GameProblem{T},
     ws.nc_step == 0 && return zero(T)
     U_flat = _concat_controls(ws)
     vmax   = zero(T)
-    for k in 1:ws.N
+    for k in 1:ws.n_con_nodes
         x_k = ws.X[:, k]
-        u_k = U_flat[:, k]
+        u_k = k <= ws.N ? U_flat[:, k] : zeros(T, size(U_flat, 1))
+        off = 0
         for c in Iterators.flatten((game.private_constraints,
                                     game.shared_constraints))
             cv = evaluate_constraint(c, x_k, u_k, nothing, k)
+            if k > ws.N   # terminal node: keep only the rows enforced there
+                cv = cv[ws.term_mask[off+1 : off+length(cv)]]
+            end
+            off += length(evaluate_constraint(c, x_k, u_k, nothing, k))
+            isempty(cv) && continue
             v  = is_inequality(c) ? maximum(max.(cv, zero(T))) : maximum(abs.(cv))
             vmax = max(vmax, v)
         end
@@ -900,6 +930,48 @@ function _al_pen(C_k ::AbstractVector{S},
         off += nc
     end
     return pen
+end
+
+"""
+    _terminal_mask(game, n, m) -> Vector{Bool}
+
+Rows of the stacked constraint vector that can be enforced at the terminal state `x(N+1)`.
+The terminal state has no control, so a row is kept only if it is independent of `u`; this
+is detected by comparing the constraint values at two different control vectors (rows that
+change are control-dependent, e.g. control bounds, and are excluded).
+"""
+function _terminal_mask(game::GameProblem{T}, n::Int, m::Int) where {T}
+    x  = Vector{T}(game.initial_state)
+    u1 = zeros(T, m)
+    u2 = T.(0.37 .+ 0.11 .* (1:m))
+    mask = Bool[]
+    for c in Iterators.flatten((game.private_constraints, game.shared_constraints))
+        c1 = evaluate_constraint(c, x, u1, nothing, 1)
+        c2 = evaluate_constraint(c, x, u2, nothing, 1)
+        append!(mask, isapprox.(c1, c2; atol = 1e-12, rtol = 1e-12))
+    end
+    return mask
+end
+
+"""
+    _terminal_con_eval(game, ws, x_T; with_jacobian=true) -> (C_T, Jcx_T, Jcu_T)
+
+Constraint values (and state Jacobian) at the terminal state, with the control set to zero and
+all rows excluded by `ws.term_mask` zeroed. Zeroed rows contribute nothing to the penalty
+(`λ = 0`, `C = 0`). Works with ForwardDiff dual numbers in `x_T` when `with_jacobian=false`.
+"""
+function _terminal_con_eval(game::GameProblem{T}, ws::ALGAMESWorkspace{S}, x_T;
+                            with_jacobian::Bool = true) where {T, S}
+    m   = sum(ws.control_dims)
+    u_T = zeros(eltype(x_T), m)
+    mask = ws.term_mask
+    if !with_jacobian
+        C = vcat([evaluate_constraint(c, x_T, u_T, nothing, ws.N + 1)
+                  for c in Iterators.flatten((game.private_constraints, game.shared_constraints))]...)
+        return C .* mask, zeros(S, 0, 0), zeros(S, 0, 0)
+    end
+    C, Jx, Ju = _con_eval(game, ws, x_T, u_T, ws.N + 1)
+    return C .* mask, Jx .* mask, Ju .* mask
 end
 
 """

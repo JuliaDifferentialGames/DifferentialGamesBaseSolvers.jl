@@ -1,0 +1,81 @@
+name: DGSQP
+# Tests for the DGSQP solver (src/solvers/DGSQP) on its own, so that a change to it is reported
+# quickly and separately from the full package suite in CI.yml, plus the paper-replication study
+# (curved-track Monte Carlo, Table I of Zhu & Borrelli, ICRA 2023) on a schedule or on demand.
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/solvers/DGSQP/**'
+      - 'src/DifferentialGamesBaseSolvers.jl'
+      - 'Project.toml'
+      - '.github/workflows/DGSQP.yml'
+  pull_request:
+    paths:
+      - 'src/solvers/DGSQP/**'
+      - 'src/DifferentialGamesBaseSolvers.jl'
+      - 'Project.toml'
+      - '.github/workflows/DGSQP.yml'
+  schedule:
+    - cron: '0 5 * * 1'      # weekly: paper replication
+  workflow_dispatch:
+    inputs:
+      trials:
+        description: 'Monte Carlo trials per (angle, horizon) setting for the paper study'
+        default: '50'
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/pull/') }}
+jobs:
+  unit:
+    name: DGSQP tests - Julia ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        version: ['1.11', '1.12']
+    steps:
+      - uses: actions/checkout@v6
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: ${{ matrix.version }}
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - name: Run DGSQP test suite
+        shell: julia --project=. --color=yes {0}
+        run: |
+          using Test
+          include("src/solvers/DGSQP/test/dgsqp_tests.jl")
+      - name: Austin racing benchmark tests (needs DifferentialGamesBenchmarks)
+        continue-on-error: true      # the benchmark package and its track data must be on GitHub main
+        shell: julia --project=. --color=yes {0}
+        run: |
+          using Pkg
+          Pkg.add(url = "https://github.com/JuliaDifferentialGames/DifferentialGamesBenchmarks.jl")
+          using Test
+          include("src/solvers/DGSQP/test/austin_benchmark_tests.jl")
+      - name: Capability vocabulary
+        shell: julia --project=. --color=yes {0}
+        run: |
+          using Test
+          include("test/capability_vocabulary_test.jl")
+  paper-study:
+    name: Paper replication (curved-track Monte Carlo)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+      - uses: julia-actions/setup-julia@v2
+        with:
+          version: '1'
+      - uses: julia-actions/cache@v2
+      - uses: julia-actions/julia-buildpkg@v1
+      - name: Run study and compare with Table I
+        shell: julia --project=. --color=yes {0}
+        env:
+          DGSQP_STUDY_TRIALS: ${{ github.event.inputs.trials || '50' }}
+        run: |
+          include("src/solvers/DGSQP/test/paper_study.jl")
