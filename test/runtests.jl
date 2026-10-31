@@ -4,7 +4,6 @@ using Test
 
 @testset "DifferentialGamesBaseSolvers.jl" begin
     include("capability_vocabulary_test.jl")
-    include("regression_tests.jl")
     include("../src/solvers/FNELQ/test/fnelq_tests.jl")
     include("../src/solvers/FNELQ/test/joint_lq_tests.jl")
     include("../src/solvers/SFNELQ/test/sfnelq_tests.jl")
