@@ -175,15 +175,137 @@ function _shift_open_loop_strategy(strat::OpenLoopStrategy{T}) where {T}
 end
 
 """
+    _shift_trajectories(trajs, game, dt) -> Vector{Trajectory{T}}
+
+Shift each player's trajectory forward by one step for warm-starting, preserving the
+node count exactly:
+  states  (n_x × N+1): columns 2…N+1, then a GENUINE dynamics rollout from the new
+                       terminal state/control pair (session correctness fix, see below).
+  controls(n_u × N)  : columns 2…N,   then repeat the terminal control (the classical
+                       Mattingley/Boyd MPC convention: hold the last control, per the file
+                       header above -- this part was always correct).
+
+Session correctness fix: the previous version repeated the OLD terminal STATE verbatim as
+the new terminal state (`new_states = hcat(states[:,2:N+1], states[:,N+1:N+1])`), paired
+with the repeated-hold control. This does NOT satisfy `x_new_{N+1} = f_d(x_new_N,
+u_new_N)` in general -- it would require the trajectory to already be at a fixed point
+under the held control, essentially never true for a real nonlinear system. Concretely:
+new_states_prefix = [x₂,…,x_{N+1}] (shifted), new_controls = [û₂,…,û_N,û_N] (held); the OLD
+code then appended x_{N+1} again as column N+2, but the dynamics-consistent value is
+`f_d(x_{N+1}, û_N)`, not `x_{N+1}` itself. Confirmed on a real receding-horizon window
+(solar-blocking DTMPC, window 97): this defect alone accounted for the ENTIRE dynamics-
+infeasibility gap at the seed (χ(z̄) dropped from 0.584 to 4.5e-6 after correcting just
+this one node), though it was not sufficient by itself to explain that window's remaining
+failure (a separate hard-constraint issue) -- see the session's window-97 diagnostic.
+
+`game` is the SAME (possibly tube/uncertainty-AUGMENTED) `GameProblem` the trajectories
+were solved against. The genuine dynamics-rollout tail is only computable when `game.dynamics
+isa SeparableDynamics`, i.e. `game.dynamics.player_dynamics[i]` gives a per-player function
+fᵢ(xᵢ, uᵢ, p, t) operating on THAT PLAYER'S OWN state/control slice alone (physical rows AND
+any augmented tube-channel rows alike -- no special-casing needed for augmented DTMPC
+states, since the augmented game's own dynamics already propagate them correctly). This is
+the actual dynamics representation used by every production RHN/DTMPC caller in this
+repo (built via `PDGNEProblem`/`IGNEP.jl`). `dt` is the game's own timestep
+(`game.time_horizon.dt`).
+
+For any OTHER `DynamicsSpec` (e.g. `LinearDynamics`, which shares ONE joint state across
+all players rather than stacking a private slice per player -- `x(k+1) = A x(k) + Σᵢ
+Bᵢuᵢ(k)` genuinely needs every player's control, not just this trajectory's own) this
+function falls back to the ORIGINAL naive terminal-state repeat. Do not attempt to unify
+this without also redesigning the per-player `map` below to see every player's
+trajectory jointly -- that redesign was explicitly out of scope for the session that
+fixed the `SeparableDynamics` case (confirmed causally, see below) and this fallback is
+what keeps the FNELQ+RHN (`LinearDynamics`) test suite passing unchanged.
+
+Length preservation is REQUIRED, not cosmetic: FALCON's `_extract_flat_trajectory`
+indexes `U[:, 1:N]` / `X[:, 1:N+1]` with no resampling and throws a `BoundsError` on a
+short seed. `times` are window-local and therefore unchanged, matching the convention in
+`_shift_feedback_strategy`/`_shift_open_loop_strategy` above.
+
+The stale first column is harmless: the consumer overwrites node 1 with the true measured
+initial state before solving.
+
+`shift` (session addition, default `1` — every existing call site is unchanged): drop the
+first `shift` nodes instead of just 1, and dynamically roll `shift` new tail nodes forward
+instead of 1, by folding the single-step shift above `shift` times. Each fold holds THAT
+fold's own terminal control constant while rolling one more step (so the net effect over
+`shift` folds is: physical/tube state dynamically propagated `shift` steps forward, control
+held at the ORIGINAL window's own terminal control value for the entire appended tail — the
+same classical hold-last-control convention, just extended over a longer coarser-cadence
+gap). Used by `DynamicTubeMPC`'s `replan_stride` option (replan every `replan_stride`
+physical steps instead of every step) to build a warm start for the NEXT replan that is
+still a genuine multi-step dynamics rollout, not a naive `shift`-node repeat.
+"""
+function _shift_trajectories(trajs::Vector{Trajectory{T}}, game::GameProblem{T}, dt::T; shift::Int=1) where {T}
+    shift <= 0 && return trajs
+    result = trajs
+    for _ in 1:shift
+        result = _shift_trajectories_once(result, game, dt)
+    end
+    return result
+end
+
+function _shift_trajectories_once(trajs::Vector{Trajectory{T}}, game::GameProblem{T}, dt::T) where {T}
+    dyn = game.dynamics
+    map(trajs) do tr
+        N = size(tr.controls, 2)
+        if N > 1
+            new_states_prefix = tr.states[:, 2:N+1]
+            new_controls      = hcat(tr.controls[:, 2:N], tr.controls[:, N:N])
+            if dyn isa SeparableDynamics && size(tr.states, 1) == sum(game.metadata.state_dims)
+                # JOINT-state trajectories (what ALGAMES and iLQGames store for a PDGNEProblem:
+                # every player's `states` holds all players' stacked states). Roll each player's
+                # block forward with its own dynamics and its own held-last control.
+                sdims = game.metadata.state_dims
+                soffs = game.metadata.state_offsets
+                x_last = new_states_prefix[:, N]
+                x_new_tail = similar(x_last)
+                for (j, objj) in enumerate(game.objectives)
+                    trj = trajs[findfirst(t -> t.player_id == objj.player_id, trajs)]
+                    uj_last = trj.controls[:, min(N, size(trj.controls, 2))]
+                    rng = soffs[j]+1 : soffs[j]+sdims[j]
+                    x_new_tail[rng] = dyn.player_dynamics[j](x_last[rng], uj_last, nothing, (N - 1) * dt)
+                end
+                new_states = hcat(new_states_prefix, x_new_tail)
+            elseif dyn isa SeparableDynamics
+                i = findfirst(obj -> obj.player_id == tr.player_id, game.objectives)
+                fᵢ = dyn.player_dynamics[i]
+                x_last = new_states_prefix[:, N]
+                u_last = new_controls[:, N]
+                x_new_tail = fᵢ(x_last, u_last, nothing, (N - 1) * dt)
+                new_states = hcat(new_states_prefix, x_new_tail)
+            else
+                # LinearDynamics (shared joint state) and any other non-separable
+                # DynamicsSpec: per-player rollout is not well-defined from a single
+                # player's own Trajectory alone. Preserve the previously-tested behavior.
+                new_states = hcat(new_states_prefix, new_states_prefix[:, N:N])
+            end
+        else
+            new_states   = copy(tr.states)      # N=1: no shift possible
+            new_controls = copy(tr.controls)
+        end
+        Trajectory{T}(tr.player_id, new_states, new_controls, copy(tr.times), tr.cost)
+    end
+end
+
+"""
     _shift_warmstart(sol::GNEPSolution{T}) -> WarmstartData{T}
 
 Build a warm-start for the next sub-problem from a converged solution.
 
-The strategy (if present) is shifted forward by one step.
-Dual variables are forwarded as-is so constrained solvers (ALGAMES)
-can continue from their previous multiplier estimates.
+The previous solution's TRAJECTORIES and strategy are both shifted forward by one step.
+Dual variables are forwarded so constrained solvers (ALGAMES, FALCON) can continue from
+their previous multiplier estimates.
+
+NOTE (bug fix): this previously passed `nothing` for `trajectories` and looked duals up
+under `:dual_variables` — a key FALCON does not emit (it emits `:λ` / `:dual_variables_λ`).
+The result was that `warm_start=true` was a silent no-op: every receding-horizon window
+fell through to FALCON's zero-control cold rollout (`_init_flat_trajectory`) with no dual
+warm start, which is the entire point of a receding-horizon loop. Consumers all guard with
+`isnothing`/length checks (see FALCON's `_try_load_dual!`), so supplying real data here is
+backward compatible.
 """
-function _shift_warmstart(sol::GNEPSolution{T}) where {T}
+function _shift_warmstart(sol::GNEPSolution{T}; shift::Int=1) where {T}
     shifted_strat = if sol.strategy isa FeedbackStrategy
         _shift_feedback_strategy(sol.strategy)
     elseif sol.strategy isa OpenLoopStrategy
@@ -192,10 +314,21 @@ function _shift_warmstart(sol::GNEPSolution{T}) where {T}
         nothing
     end
 
-    # Carry dual variables (ALGAMES uses these for warm-starting multipliers)
-    duals = get(sol.solver_info, :dual_variables, nothing)
+    shifted_trajs = isnothing(sol.trajectories) ? nothing :
+        _shift_trajectories(sol.trajectories, sol.game, sol.game.time_horizon.dt; shift=shift)
 
-    return WarmstartData{T}(nothing, shifted_strat, duals, Dict{Symbol, Any}())
+    # Carry dual variables. Try the generic key first, then the keys FALCON actually
+    # emits; wrap in a Dict{Symbol,Any} so downstream `haskey` lookups work uniformly.
+    duals = get(sol.solver_info, :dual_variables, nothing)
+    if isnothing(duals)
+        d = Dict{Symbol, Any}()
+        for k in (:λ, :dual_variables_λ, :μ)
+            haskey(sol.solver_info, k) && (d[k] = sol.solver_info[k])
+        end
+        duals = isempty(d) ? nothing : d
+    end
+
+    return WarmstartData{T}(shifted_trajs, shifted_strat, duals, Dict{Symbol, Any}())
 end
 
 # ============================================================================

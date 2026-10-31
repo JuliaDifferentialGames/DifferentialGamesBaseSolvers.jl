@@ -1,5 +1,7 @@
 # DifferentialGamesBaseSolvers.jl
 
+<p align="center"><img src="https://raw.githubusercontent.com/JuliaDifferentialGames/DifferentialGames.jl/main/docs/src/assets/logo.png" alt="DifferentialGames.jl logo" width="160"></p>
+
 [![CI](https://github.com/JuliaDifferentialGames/DifferentialGamesBaseSolvers.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/JuliaDifferentialGames/DifferentialGamesBaseSolvers.jl/actions/workflows/CI.yml)
 [![Docs](https://img.shields.io/badge/docs-DifferentialGames.jl-blue.svg)](https://JuliaDifferentialGames.github.io/DifferentialGames.jl/stable)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
@@ -16,6 +18,8 @@ Numerical solvers for the [DifferentialGames.jl](https://github.com/JuliaDiffere
 | `FNELQ` | Feedback Nash | ✗ | Exact for LQ games; O(N·n³) |
 | `iLQGames` | Feedback Nash | ✗ | Nonlinear games; iterative LQ approximation |
 | `ALGAMES` | Open-loop Nash | ✓ | Augmented Lagrangian; private + shared constraints |
+| `DGSQP` | Open-loop Nash | ✓ | Sequential QP (Zhu & Borrelli); one QP per iteration, non-monotone step acceptance; `dgsqp_tuned_options()` for hard racing problems |
+| `falcon()` | Open-loop Nash (PD-GNEP) | ✓ | [FALCON](https://github.com/BennetOutland/FALCON.jl), a soft dependency: sequential convexification with one joint SOCP per iteration; needs `using FALCON` |
 
 ## Installation
 
@@ -81,6 +85,19 @@ sol  = solve(game, iLQGames())
 anim = animate_solution(sol)
 gif(anim, "game.gif"; fps=20)
 ```
+
+## FALCON (Optional)
+
+FALCON is a separate package and is not installed with this one. Load it to activate the extension:
+
+```julia
+using Pkg; Pkg.add(url = "https://github.com/BennetOutland/FALCON.jl")
+using DifferentialGamesBase, DifferentialGamesBaseSolvers, FALCON
+
+sol = solve(game, falcon(; ϵ_opt = 2e-2, ϵ_feas = 1e-4); warmstart = ws)   # game: a PDGNEProblem
+```
+
+Without `using FALCON`, `falcon` has no methods and says what to load.
 
 ## Adding New Solvers
 

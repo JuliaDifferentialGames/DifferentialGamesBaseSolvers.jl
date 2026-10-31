@@ -143,6 +143,47 @@ function plot_trajectories(sol::GNEPSolution;
 end
 
 # ============================================================================
+# animate_solution / save_animation
+# ============================================================================
+
+function DifferentialGamesBaseSolvers.animate_solution(sol::GNEPSolution;
+                                                       fps::Int = 20,
+                                                       subsample::Int = 1,
+                                                       xy_indices = nothing,
+                                                       kwargs...)
+    subsample >= 1 || throw(ArgumentError("subsample must be ≥ 1"))
+    game = sol.game
+    np   = game.n_players
+    X    = sol.state_trajectory
+    X === nothing && (X = hcat([sol.trajectories[1].states]...))   # PD-GNEP solutions store the joint state in every trajectory
+    xi, yi = _resolve_xy_indices(game, np, xy_indices)
+    frames = 1:subsample:size(X, 2)
+    xlim = extrema(vcat((X[xi[i], :] for i in 1:np)...))
+    ylim = extrema(vcat((X[yi[i], :] for i in 1:np)...))
+    pad(lim) = (lim[1] - 0.1 * max(lim[2] - lim[1], 1.0), lim[2] + 0.1 * max(lim[2] - lim[1], 1.0))
+    anim = Plots.Animation()
+    for f in frames
+        p = plot(; aspect_ratio = :equal, xlabel = "x", ylabel = "y",
+                   xlims = pad(xlim), ylims = pad(ylim), legend = :outertopright,
+                   title = "t = $(round(sol.trajectories[1].times[f]; digits = 2))", kwargs...)
+        for i in 1:np
+            col = _player_colour(i)
+            plot!(p, X[xi[i], 1:f], X[yi[i], 1:f]; color = col, linewidth = 2, label = "Player $i")
+            scatter!(p, [X[xi[i], f]], [X[yi[i], f]]; color = col, markersize = 7, label = false)
+        end
+        Plots.frame(anim, p)
+    end
+    return anim
+end
+
+function DifferentialGamesBaseSolvers.save_animation(anim::Plots.Animation, path::String; fps::Int = 20)
+    ext = lowercase(splitext(path)[2])
+    ext in (".gif", ".mp4") || throw(ArgumentError("unsupported format '$ext'; use .gif or .mp4"))
+    Plots.gif(anim, path; fps = fps)
+    return path
+end
+
+# ============================================================================
 # plot_convergence
 # ============================================================================
 

@@ -173,6 +173,7 @@ solver_capabilities(::Type{iLQGames}) = [
     :NonlinearGame,
     :LQGame,
     :UnconstrainedGame,
+    :SeparableDynamics,
     :DiscreteTime
 ]
 
@@ -518,7 +519,6 @@ function _solve(
                                  regularization=Float64(μ))
             lq_sol  = _solve(lq_game, fnelq_solver, nothing, false)
             fnelq_ok = lq_sol.converged
-            @info "lq_sol strategy feedforward" lq_sol.strategy.feedforward[1][1] lq_sol.strategy.nominal_controls[1][:,1]
         end
 
         strat_new = lq_sol.strategy
@@ -551,26 +551,6 @@ function _solve(
         # Step 5–6: Line search.
         # FIX-3: starts at η=1 (full LQ step).
         # FIX-4: failure returns (X_curr, U_curr) unchanged.
-
-        # Add this directly before the _line_search call in _solve
-        function apply_strategy_debug(s::FeedbackStrategy{T}, x::AbstractVector, k::Int; η::Real=one(T)) where {T}
-            x̂ = s.nominal_states[:, k]
-            û = s.nominal_controls[1][:, k]
-            P = s.gains[1][k]
-            δx = x - x̂
-            u  = û - P * δx - η .* s.feedforward[1][k]
-            @info "apply_strategy_debug" k x=x[1] x̂=x̂[1] û=û[1] P=P[1,1] δx=δx[1] u=u[1]
-            return u
-        end
-
-        if verbose
-            u_test = apply_strategy_debug(strat_new, X[:, 1], 1; η=T(1.0))
-            @info "  rebase check" k=1 x=X[1,1] u_applied=u_test[1] u_nom_k1=strat_new.nominal_controls[1][1,1] P_k1=strat_new.gains[1][1][1,1]
-            @info "nominal_states col 1" strat_new.nominal_states[:, 1]
-            @info "nominal_controls[1] col 1" strat_new.nominal_controls[1][:, 1]  
-            @info "X col 1" X[:, 1]
-        end
-
 
         η, X_new, U_new, costs_new, ls_ok = _line_search(
             game, x0, X, U, strat_new,
