@@ -51,6 +51,10 @@ SFNELQ(;
     regularization::Real = 0.0
 ) = SFNELQ(check_singularity, Float64(rcond_threshold), Float64(regularization))
 
+get_covariance_trajectory(sol) = sol.solver_info[:state_covariances]
+get_expected_costs(sol) = sol.solver_info[:expected_costs]
+get_mean_trajectory(sol) = sol.state_trajectory
+
 solver_capabilities(::Type{SFNELQ}) = [:LQGame, :Stochastic, :FeedbackPolicies, :DiscreteTime]
 
 """
@@ -64,12 +68,49 @@ function additive_noise_cost(sgame::StochasticGameProblem{T}, Z_history::Vector{
     g = sgame.nominal_game
     np = num_players(g)
     N = n_steps(g)
-    W = get_W(sgame)
     out = zeros(T, np)
-    for i in 1:np, k in 1:N
-        out[i] += T(0.5) * tr(Z_history[i][k+1] * W)
+    for i in 1:np
+        # Uncertain initial state: E[½x₀ᵀZ₀x₀] = ½μ₀ᵀZ₀μ₀ + ½tr(Z₀Σ₀).
+        out[i] += T(0.5) * tr(Z_history[i][1] * sgame.initial_covariance)
+        for k in 1:N
+            out[i] += T(0.5) * tr(Z_history[i][k+1] * get_W(sgame, k))
+        end
+        # FNELQ scales each player's deterministic cost by the objective scaling;
+        # the noise contribution must be scaled identically to stay an expected cost.
+        out[i] *= get_objective(g, i).scaling
     end
     return out
+end
+
+"""
+    gaussian_trajectory_moments(sgame, strategy) -> NamedTuple
+
+Mean-independent second moments of the physical state and joint control under
+the affine feedback `u_k = -P_k x_k - α_k`:
+
+- `state_covariances[k]`        = Cov(x_k),  k = 1,…,N+1 (`Σ₀ = initial_covariance`)
+- `control_covariances[k]`      = Cov(u_k) = P Σ Pᵀ,  k = 1,…,N
+- `state_control_covariances[k]`= Cov(x_k, u_k) = -Σ Pᵀ
+
+`P_k` is the joint gain stacked over players. These are covariances of the
+*physical* state under perfect state observation.
+"""
+function gaussian_trajectory_moments(sgame::StochasticGameProblem{T}, strategy) where {T}
+    g = sgame.nominal_game
+    dyn = g.dynamics
+    np = num_players(g)
+    N = n_steps(g)
+    Σ = copy(sgame.initial_covariance)
+    Σs = [copy(Σ)]; Σu = Matrix{T}[]; Σxu = Matrix{T}[]
+    for k in 1:N
+        P = vcat((strategy.gains[i][k] for i in 1:np)...)
+        F = get_A(dyn, k) - get_B_concatenated(dyn, k) * P
+        push!(Σu, Symmetric(P * Σ * P') |> Matrix)
+        push!(Σxu, -Σ * P')
+        Σ = Symmetric(F * Σ * F' + get_W(sgame, k)) |> Matrix
+        push!(Σs, copy(Σ))
+    end
+    return (state_covariances = Σs, control_covariances = Σu, state_control_covariances = Σxu)
 end
 
 function _solve(
@@ -105,6 +146,7 @@ function _solve(
     solver_info[:noise_cost] = noise_cost
     solver_info[:certainty_equivalent] = true
     solver_info[:expected_costs] = [t.cost for t in trajectories]
+    merge!(solver_info, Dict{Symbol, Any}(pairs(gaussian_trajectory_moments(sgame, det_sol.strategy))))
 
     return GNEPSolution(
         det_sol.game, trajectories;

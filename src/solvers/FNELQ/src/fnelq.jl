@@ -43,8 +43,8 @@ solver_capabilities(::Type{FNELQ}) = [
 function extract_lq_matrices(game::GameProblem{T}) where {T}
     @assert(game.dynamics isa LinearDynamics,
         "FNELQ requires LinearDynamics; got $(typeof(game.dynamics))")
-    @assert(all(obj.stage_cost isa LQStageCost for obj in game.objectives),
-        "FNELQ requires LQStageCost for all objectives")
+    @assert(all(obj.stage_cost isa Union{LQStageCost, JointLQStageCost} for obj in game.objectives),
+        "FNELQ requires LQStageCost or JointLQStageCost for all objectives")
     @assert(all(obj.terminal_cost isa LQTerminalCost for obj in game.objectives),
         "FNELQ requires LQTerminalCost for all objectives")
 
@@ -57,6 +57,27 @@ function extract_lq_matrices(game::GameProblem{T}) where {T}
 
     return dyn, stage_costs, Qf, qf_affine, total_state_dim(dyn), np
 end
+
+# Player i's stage cost as joint-control matrices (Q, R, M, q, r) with R: m×m,
+# M: n×m, r: m. An own-control `LQStageCost` is embedded in player i's control
+# block; a `JointLQStageCost` is used as is.
+function _joint_cost_mats(sc::JointLQStageCost, i, k, ranges, n, m, ::Type{T}) where {T}
+    return get_Q(sc, k), get_R(sc, k), get_M(sc, k), get_q(sc, k), get_r(sc, k)
+end
+
+function _joint_cost_mats(sc::LQStageCost, i, k, ranges, n, m, ::Type{T}) where {T}
+    ri = ranges[i]
+    R = zeros(T, m, m); R[ri, ri] = get_R(sc, k)
+    M = zeros(T, n, m); M[:, ri] = get_M(sc, k)
+    r = zeros(T, m);    r[ri]    = get_r(sc, k)
+    return get_Q(sc, k), R, M, get_q(sc, k), r
+end
+
+# Stage cost of player i given the joint control (own-control costs take u^i only).
+_stage_cost_value(sc::JointLQStageCost, i, ranges, x, u_joint, k) =
+    evaluate_stage_cost(sc, x, u_joint, nothing, k)
+_stage_cost_value(sc::LQStageCost, i, ranges, x, u_joint, k) =
+    evaluate_stage_cost(sc, x, u_joint[ranges[i]], nothing, k)
 
 function _solve(
     game::GameProblem{T},
@@ -75,28 +96,18 @@ function _solve(
     N     = n_steps(game)
     t_vec = collect(range(T(0), game.time_horizon.tf, length=N+1))
 
-    ks = is_ltv(dyn) ? (1:N) : (1:1)
-
-    has_M = any(
-        norm(get_M(stage_costs[i], k)) > eps(T)
-        for i in 1:np, k in ks
-    )
-    has_affine = any(
-        norm(get_q(stage_costs[i], k)) > eps(T) ||
-        norm(get_r(stage_costs[i], k)) > eps(T) ||
-        norm(qf_affine[i]) > eps(T)
-        for i in 1:np, k in ks
-    )
-
+    m_tot = total_m
+    mats(i, k) = _joint_cost_mats(stage_costs[i], i, k, control_ranges, n, m_tot, T)
     t_start = time()
 
     Z = [((Qf[i] + Qf[i]') / 2) for i in 1:np]
-    ζ = has_affine ? [copy(qf_affine[i]) for i in 1:np] : nothing
+    ζ = [copy(qf_affine[i]) for i in 1:np]
 
     P_history  = [Matrix{T}[] for _ in 1:np]
-    α_history  = has_affine ? [Vector{T}[] for _ in 1:np] : nothing
+    α_history  = [Vector{T}[] for _ in 1:np]
     Z_history  = [[copy(Z[i])] for i in 1:np]
     rcond_hist = Float64[]
+    min_own_eig = Inf   # smallest eigenvalue of any player's own-control Hessian block
 
     max_P_norm  = 0.0
     max_Z_norm  = 0.0
@@ -105,44 +116,30 @@ function _solve(
     for k in N:-1:1
         Ak  = get_A(dyn, k)
         Bk  = get_B_concatenated(dyn, k)
-        Qk  = [get_Q(stage_costs[i], k) for i in 1:np]
-        Rk  = [get_R(stage_costs[i], k) for i in 1:np]
-        Mk  = has_M      ? [get_M(stage_costs[i], k) for i in 1:np] : nothing
-        qk  = has_affine ? [get_q(stage_costs[i], k) for i in 1:np] : nothing
-        rk  = has_affine ? [get_r(stage_costs[i], k) for i in 1:np] : nothing
+        cm  = [mats(i, k) for i in 1:np]
+        Qk  = [c[1] for c in cm]; Rk = [c[2] for c in cm]; Mk = [c[3] for c in cm]
+        qk  = [c[4] for c in cm]; rk = [c[5] for c in cm]
 
-        S  = zeros(T, total_m, total_m)
-        YP = zeros(T, total_m, n)
-        Yα = has_affine ? zeros(T, total_m) : nothing
-
-        # ── Player loop: assemble S, YP, Yα only ─────────────────────────────
-        # NOTE: NO solve, NO pushfirst! inside this loop.
+        # Stationarity of player i in its own control block: row block i of
+        #   (R_i + BᵀZ_iB) u + (M_iᵀ + BᵀZ_iA) x + (r_i + Bᵀζ_i) = 0.
+        S  = zeros(T, m_tot, m_tot)
+        YP = zeros(T, m_tot, n)
+        Yα = zeros(T, m_tot)
         for i in 1:np
-            ri   = control_ranges[i]
-            Bi   = get_B(dyn, i, k)
-            BiZi = Bi' * Z[i]
-
-            for j in 1:np
-                rj = control_ranges[j]
-                Bj = get_B(dyn, j, k)
-                S[ri, rj] = (i == j ? Rk[i] : zeros(T, length(ri), length(rj))) +
-                             BiZi * Bj
-            end
-
-            YP[ri, :] = BiZi * Ak
-            has_M && (YP[ri, :] += Mk[i]')
-            # Optimal control is u = -P x - α with α = S⁻¹ (Bᵀζ + r); the forward pass and the
-            # ζ recursion below both assume this sign convention.
-            has_affine && (Yα[ri] = Bi' * ζ[i] + rk[i])
+            ri = control_ranges[i]
+            BZ = Bk' * Z[i]
+            S[ri, :]  = (Rk[i] + BZ * Bk)[ri, :]
+            YP[ri, :] = (Mk[i]' + BZ * Ak)[ri, :]
+            Yα[ri]    = (rk[i] + Bk' * ζ[i])[ri]
+            # Second-order condition: own-control block must be positive definite.
+            Sii = Symmetric(S[ri, ri])
+            min_own_eig = min(min_own_eig, minimum(eigvals(Sii)))
         end
 
         if solver.regularization > zero(T)
             μ_s = T(solver.regularization)
-            for i in 1:np
-                ri = control_ranges[i]
-                for j in ri
-                    S[j, j] += μ_s
-                end
+            for j in 1:m_tot
+                S[j, j] += μ_s
             end
         end
 
@@ -157,47 +154,27 @@ function _solve(
         end
 
         P_full = S \ YP
+        α_full = S \ Yα
+        β_affine = -Bk * α_full
         Pk = [P_full[control_ranges[i], :] for i in 1:np]
+        αk = [α_full[control_ranges[i]] for i in 1:np]
         for i in 1:np
             pushfirst!(P_history[i], Pk[i])
+            pushfirst!(α_history[i], αk[i])
             max_P_norm = max(max_P_norm, norm(Pk[i]))
         end
 
-        # ── Affine solve: exactly once per timestep, outside player loop ──────
-        αk       = nothing
-        β_affine = nothing
-        if has_affine
-            α_full   = S \ Yα
-            β_affine = -Bk * α_full
-            αk = [α_full[control_ranges[i]] for i in 1:np]
-
-            for i in 1:np
-                pushfirst!(α_history[i], αk[i])
-            end
-        end
-
         F = Ak - Bk * P_full
-
         for i in 1:np
-            Pi = Pk[i]
-            Ri = Rk[i]
-
-            # FIX-1: save Z_old before overwriting
             Z_old_i = Z[i]
-
-            Z[i] = F' * Z[i] * F + Qk[i] + Pi' * Ri * Pi
-            if has_M
-                Mi   = Mk[i]
-                Z[i] -= Mi * Pi + Pi' * Mi'
-            end
+            # Substituting u = -P x - α into the stage cost and next value function.
+            Z[i] = F' * Z_old_i * F + Qk[i] + P_full' * Rk[i] * P_full -
+                   Mk[i] * P_full - P_full' * Mk[i]'
             Z[i] = (Z[i] + Z[i]') / 2
             pushfirst!(Z_history[i], Z[i])
             max_Z_norm = max(max_Z_norm, norm(Z[i]))
-
-            if has_affine
-                ζ[i] = F' * (ζ[i] + Z_old_i * β_affine) +
-                        qk[i] + Pi' * Ri * αk[i] - Pi' * rk[i]
-            end
+            ζ[i] = F' * (ζ[i] + Z_old_i * β_affine) + qk[i] +
+                   P_full' * Rk[i] * α_full - P_full' * rk[i] - Mk[i] * α_full
         end
 
         if verbose && (k % max(1, N ÷ 5) == 0 || k == 1 || k == N)
@@ -216,8 +193,7 @@ function _solve(
         xk = x_traj[:, k]
         B_u_sum = zeros(T, n)
         for i in 1:np
-            ui_opt = -P_history[i][k] * xk
-            has_affine && (ui_opt -= α_history[i][k])
+            ui_opt = -P_history[i][k] * xk - α_history[i][k]
             u_trajs[i][:, k] = ui_opt
             B_u_sum += get_B(dyn, i, k) * ui_opt
         end
@@ -230,7 +206,8 @@ function _solve(
     for i in 1:np
         sc = stage_costs[i]
         for k in 1:N
-            costs[i] += evaluate_stage_cost(sc, x_traj[:, k], u_trajs[i][:, k], nothing, k)
+            u_joint = vcat((u_trajs[j][:, k] for j in 1:np)...)
+            costs[i] += _stage_cost_value(sc, i, control_ranges, x_traj[:, k], u_joint, k)
         end
         costs[i] += evaluate_terminal_cost(get_objective(game, i).terminal_cost,
                                             x_traj[:, N+1], nothing)
@@ -242,8 +219,7 @@ function _solve(
         for i in 1:np
     ]
 
-    ff = has_affine ? α_history :
-                      [[zeros(T, control_dims[i]) for _ in 1:N] for i in 1:np]
+    ff = α_history
 
     # ─────────────────────────────────────────────────────────────────────────
 
@@ -273,6 +249,8 @@ function _solve(
             :cost_to_go_matrices  => Z_history,
             :rcond_history        => rcond_hist,
             :min_rcond            => min_rcond,
+            :min_own_hessian_eig  => min_own_eig,
+            :second_order_ok      => min_own_eig > 0,
             :max_Z_norm           => max_Z_norm,
             :max_P_norm           => max_P_norm,
             :backward_pass_time   => backward_time,
