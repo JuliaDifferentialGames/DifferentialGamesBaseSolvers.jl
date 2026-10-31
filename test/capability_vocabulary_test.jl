@@ -11,7 +11,7 @@ using Test
 # ============================================================================
 
 const ALL_SOLVER_TYPES = [
-    FNELQ, SFNELQ, iLQGames, ALGAMES, LIBR, YiPavel,
+    FNELQ, SFNELQ, CCiLQGames, iLQGames, ALGAMES, LIBR, YiPavel,
     InverseLQGames, RecedingHorizonNash,
 ]
 
