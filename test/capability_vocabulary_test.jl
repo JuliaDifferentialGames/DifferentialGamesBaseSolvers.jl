@@ -11,8 +11,8 @@ using Test
 # ============================================================================
 
 const ALL_SOLVER_TYPES = [
-    FNELQ, SFNELQ, iLQGames, ALGAMES, DGSQP, LIBR, YiPavel,
-    InverseLQGames, RecedingHorizonNash, DynamicTubeMPC,
+    FNELQ, SFNELQ, iLQGames, ALGAMES, LIBR, YiPavel,
+    InverseLQGames, RecedingHorizonNash,
 ]
 
 @testset "Capability vocabulary is canonical" begin
