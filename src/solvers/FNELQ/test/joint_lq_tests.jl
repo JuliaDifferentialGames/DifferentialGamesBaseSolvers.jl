@@ -147,3 +147,16 @@ end
         @test sol.converged && sol.solver_info[:status] === :solved
     end
 end
+
+@testset "SFNELQ: capability guards" begin
+    A = [1.0 0.1; 0.0 1.0]; B = [reshape([0.0, 0.1], 2, 1)]
+    g = LQGameProblem(A, B, [Matrix(1.0I, 2, 2)], [reshape([1.0], 1, 1)],
+                      [Matrix(1.0I, 2, 2)], [0.0, 0.0], 3.0; dt = 1.0)
+    W = ProcessNoiseModel(Matrix(0.01I, 2, 2))
+    shared = SharedObservation((x, v, p, t) -> x[1:1] .+ v, 1, reshape([0.1], 1, 1))
+    @test_throws ErrorException solve(StochasticGameProblem(g, W; information = shared), SFNELQ())
+    cc = ChanceConstraint(StateBounds(1; state_offset = 0, state_dim = 2,
+                                      lower = [-5.0, -5.0], upper = [1.0, 5.0]), 0.05)
+    @test_throws ErrorException solve(StochasticGameProblem(g, W; chance_constraints = [cc]), SFNELQ())
+    @test solve(StochasticGameProblem(g, W), SFNELQ()).converged
+end

@@ -125,6 +125,15 @@ function _solve(
         this path is not yet implemented, see DifferentialGamesBase.jl docs/src/api/stochastic.md.
         """)
 
+    sgame.information isa PerfectStateInformation || error("""
+        SFNELQ supports PerfectStateInformation only; got $(typeof(sgame.information)).
+        Shared-observation LQ games need a filtering-aware solver.
+        """)
+    isempty(all_chance_constraints(sgame)) || error("""
+        SFNELQ solves unconstrained games; the problem declares chance constraints.
+        Use a chance-constrained solver (e.g. CCiLQGames) instead.
+        """)
+
     g = sgame.nominal_game
     verbose && @info("SFNELQ: delegating gains to FNELQ (certainty equivalence)",
         players = num_players(g), steps = n_steps(g))
